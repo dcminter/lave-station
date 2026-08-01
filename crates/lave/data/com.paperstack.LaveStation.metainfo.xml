@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.paperstack.LaveStation</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Lave Station</name>
+  <summary>Inspect Docker images and containers</summary>
+
+  <description>
+    <p>
+      Lave Station is a GTK interface to the Docker daemon on your own machine. It
+      speaks the daemon's API directly rather than driving the command line tool.
+    </p>
+    <p>
+      The sidebar lists the images and containers on this device, running and stopped.
+      Selecting anything shows its metadata, and the root of the tree reports the local
+      Docker environment itself: the endpoint in use, the negotiated API version, the
+      storage driver, and the cgroup configuration.
+    </p>
+    <p>
+      The window stays up to date by subscribing to the daemon's event stream, and a
+      panel indicator reports the connection while the window is closed.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.paperstack.LaveStation.desktop</launchable>
+
+  <developer id="com.paperstack">
+    <name>Dave Minter</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <categories>
+    <category>Development</category>
+    <category>System</category>
+  </categories>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-01">
+      <description>
+        <p>First iteration: the window, the tree of images and containers, and the
+        environment overview.</p>
+      </description>
+    </release>
+  </releases>
+</component>

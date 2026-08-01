@@ -1,15 +1,31 @@
-[package]
-name = "lave"
+[workspace]
+resolver = "3"
+members = ["crates/lave-core", "crates/lave"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
 
-[dependencies]
+[workspace.dependencies]
+async-channel = "2.5"
+async-trait = "0.1"
+bollard = "0.21"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[lints.rust]
+[workspace.lints.rust]
 # CLAUDE.md: no unsafe. `forbid` cannot be overridden by #[allow].
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 # High-pedantry baseline; priority -1 lets specific lints below override the group.
 pedantic = { level = "warn", priority = -1 }
 # CLAUDE.md: no unwrap. expect is allowed only in bootstrap, so it warns rather than denies.

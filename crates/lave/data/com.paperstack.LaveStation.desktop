@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Lave Station
+GenericName=Container Manager
+Comment=Inspect Docker images and containers on this machine
+Exec=lave
+Icon=com.paperstack.LaveStation
+Terminal=false
+Type=Application
+Categories=GTK;Development;System;
+Keywords=docker;container;image;podman;
+StartupNotify=true
+# X11 fallback only — Wayland uses app_id.
+StartupWMClass=com.paperstack.LaveStation

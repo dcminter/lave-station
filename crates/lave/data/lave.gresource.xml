@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/com/paperstack/LaveStation">
+    <file preprocess="xml-stripblanks">ui/window.ui</file>
+    <file compressed="true">style.css</file>
+    <!-- Aliased into the layout GtkIconTheme expects from a resource path. -->
+    <file preprocess="xml-stripblanks" alias="icons/scalable/apps/com.paperstack.LaveStation.svg">icons/hicolor/scalable/apps/com.paperstack.LaveStation.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/symbolic/apps/com.paperstack.LaveStation-symbolic.svg">icons/hicolor/symbolic/apps/com.paperstack.LaveStation-symbolic.svg</file>
+  </gresource>
+</gresources>

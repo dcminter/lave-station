@@ -1,0 +1,13 @@
+/* Adwaita named colours only, so the app follows the user's theme and accent. */
+
+.raw-inspect {
+  font-family: monospace;
+  font-size: 0.9em;
+  padding: 6px;
+  color: @window_fg_color;
+}
+
+.tree-detail {
+  color: @window_fg_color;
+  opacity: 0.6;
+}

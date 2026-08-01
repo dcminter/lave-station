@@ -1,0 +1,26 @@
+[package]
+name = "lave-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bollard.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[features]
+# Tests that require a reachable Docker daemon; off by default so `cargo test` is hermetic.
+live-docker = []
+
+[lints]
+workspace = true
