@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // empty' | grep -q '\\.rs$' && cargo fmt || true",
+            "statusMessage": "cargo fmt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f Cargo.toml || exit 0; test -n \"$(git status --porcelain -- '*.rs')\" || exit 0; cargo fmt && cargo clippy --all-targets --all-features -- -W clippy::pedantic -D warnings && cargo test || exit 2",
+            "timeout": 300,
+            "statusMessage": "Verifying: fmt + clippy (pedantic) + tests"
+          }
+        ]
+      }
+    ]
+  }
+}

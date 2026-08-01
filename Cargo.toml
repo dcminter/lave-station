@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[lints.rust]
+# CLAUDE.md: no unsafe. `forbid` cannot be overridden by #[allow].
+unsafe_code = "forbid"
+
+[lints.clippy]
+# High-pedantry baseline; priority -1 lets specific lints below override the group.
+pedantic = { level = "warn", priority = -1 }
+# CLAUDE.md: no unwrap. expect is allowed only in bootstrap, so it warns rather than denies.
+unwrap_used = "deny"
+expect_used = "warn"

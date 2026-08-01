@@ -18,6 +18,10 @@ Use the Clap tool to parse and document command line options.
 
 Any comments in the code must be very concise.
 
+## Tooling preferences
+
+Prefer native Debian/Linux command-line tools (jq, grep, sed, awk, etc.) over Python, Bash, and similar scripting languages for scripting and text processing. They are more succinct for the job and always available on the target platform.
+
 ## Other best-practices docs
 
 Consult as necessary:
