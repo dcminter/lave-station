@@ -165,6 +165,10 @@ pub trait ContainerEngine: Send + Sync {
     /// Raw inspect output, rendered verbatim in the detail pane.
     async fn inspect_image(&self, id: &str) -> Result<serde_json::Value, EngineError>;
 
+    /// An image's layer digests, base first. Not carried by the image listing, so this
+    /// costs one inspect per image; the caller is expected to cache the result.
+    async fn image_layers(&self, id: &str) -> Result<Vec<String>, EngineError>;
+
     async fn inspect_container(&self, id: &str) -> Result<serde_json::Value, EngineError>;
 
     /// Never-ending event stream. `since` replays the gap after a reconnect.

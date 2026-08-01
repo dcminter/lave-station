@@ -115,6 +115,21 @@ impl ContainerEngine for BollardEngine {
         serde_json::to_value(inspect).map_err(|error| EngineError::Protocol(error.to_string()))
     }
 
+    async fn image_layers(&self, id: &str) -> Result<Vec<String>, EngineError> {
+        let inspect = self
+            .docker
+            .inspect_image(id)
+            .await
+            .map_err(|error| self.translate(&error))?;
+
+        // An image with no root filesystem is legal, if unusual; report it as empty
+        // rather than as a failure.
+        Ok(inspect
+            .root_fs
+            .and_then(|root| root.layers)
+            .unwrap_or_default())
+    }
+
     async fn inspect_container(&self, id: &str) -> Result<serde_json::Value, EngineError> {
         let inspect = self
             .docker

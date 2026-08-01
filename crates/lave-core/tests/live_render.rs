@@ -8,6 +8,7 @@
 
 use lave_core::endpoint::{SystemEnv, SystemPaths, resolve};
 use lave_core::engine::{ContainerEngine, bollard_engine::BollardEngine};
+use lave_core::model::relations::{self, LayerIndex};
 use lave_core::model::{detail, tree};
 
 fn utc() -> chrono::FixedOffset {
@@ -32,7 +33,22 @@ fn print_page(page: &detail::DetailPage) {
     for group in &page.groups {
         println!("  [{}]", group.title);
         for row in &group.rows {
-            println!("    {:<22} {}", row.label, row.value);
+            let arrow = if row.link.is_some() { "->" } else { "  " };
+            println!("  {arrow}{:<22} {}", row.label, row.value);
+        }
+    }
+    if let Some(table) = &page.table {
+        println!("  [table: {}]", table.column_titles().join(" | "));
+        for index in 0..table.rows.len().min(5) {
+            let cells: Vec<String> = table.rows[index]
+                .cells
+                .iter()
+                .map(|cell| cell.text.clone())
+                .collect();
+            println!("    {}", cells.join(" | "));
+        }
+        if table.rows.len() > 5 {
+            println!("    ... {} more", table.rows.len() - 5);
         }
     }
     if let Some(raw) = &page.raw {
@@ -50,6 +66,25 @@ async fn the_whole_read_path_produces_sensible_output() {
     let environment = engine.probe().await.expect("probe succeeds");
     let images = engine.list_images().await.expect("images listed");
     let containers = engine.list_containers().await.expect("containers listed");
+
+    let mut layers = LayerIndex::new();
+    for image in &images {
+        let digests = engine
+            .image_layers(&image.id)
+            .await
+            .expect("image layers read");
+        layers.insert(&image.id, digests);
+    }
+
+    let cx = detail::Context {
+        images: &images,
+        containers: &containers,
+        layers: &layers,
+        raw: None,
+        now: now(),
+        offset: utc(),
+        show_stopped: true,
+    };
 
     // The tree the sidebar will show.
     let root = tree::build(Some(&environment), &images, &containers);
@@ -89,16 +124,20 @@ async fn the_whole_read_path_produces_sensible_output() {
     );
 
     // Every page the pane can show, for the real data.
-    print_page(&detail::environment(&environment, &resolved, None));
-    print_page(&detail::images(&images));
-    print_page(&detail::containers(&containers));
+    print_page(&detail::environment(&environment, &resolved, &cx));
+    print_page(&detail::images(&cx));
+    print_page(&detail::containers(&cx));
 
     if let Some(image) = images.first() {
         let raw = engine
             .inspect_image(&image.id)
             .await
             .expect("image inspect succeeds");
-        print_page(&detail::image(image, Some(&raw), now(), utc()));
+        let cx = detail::Context {
+            raw: Some(&raw),
+            ..cx
+        };
+        print_page(&detail::image(image, &cx));
     }
 
     if let Some(container) = containers.first() {
@@ -106,14 +145,18 @@ async fn the_whole_read_path_produces_sensible_output() {
             .inspect_container(&container.id)
             .await
             .expect("container inspect succeeds");
-        print_page(&detail::container(container, Some(&raw), now(), utc()));
+        let cx = detail::Context {
+            raw: Some(&raw),
+            ..cx
+        };
+        print_page(&detail::container(container, &cx));
     }
 
     // No page should render a field as an empty string; absent values say so.
     for page in [
-        detail::environment(&environment, &resolved, None),
-        detail::images(&images),
-        detail::containers(&containers),
+        detail::environment(&environment, &resolved, &cx),
+        detail::images(&cx),
+        detail::containers(&cx),
     ] {
         for group in &page.groups {
             for row in &group.rows {
@@ -124,6 +167,97 @@ async fn the_whole_read_path_produces_sensible_output() {
                     row.label
                 );
             }
+        }
+    }
+}
+
+/// The relationships Version 2 adds, against whatever the daemon actually holds.
+#[tokio::test]
+async fn relationships_hold_together_on_real_data() {
+    let resolved = resolve(None, &SystemEnv, &SystemPaths).expect("a daemon is reachable");
+    let engine = BollardEngine::connect(resolved.endpoint.path())
+        .await
+        .expect("connects to the daemon");
+
+    let images = engine.list_images().await.expect("images listed");
+    let containers = engine.list_containers().await.expect("containers listed");
+
+    let mut layers = LayerIndex::new();
+    for image in &images {
+        let digests = engine
+            .image_layers(&image.id)
+            .await
+            .expect("image layers read");
+        layers.insert(&image.id, digests);
+    }
+
+    println!("\n== derivation, reconstructed from shared layer prefixes ==");
+    let mut derivations = 0;
+    for image in &images {
+        if let Some(base) = relations::base_of(image, &images, &layers) {
+            derivations += 1;
+            let shared = layers.get(&base.id).map_or(0, <[String]>::len);
+            let own = layers.get(&image.id).map_or(0, <[String]>::len);
+            println!(
+                "  {} <- FROM {} ({shared} of {own} layers)",
+                lave_core::model::format::image_label(image),
+                lave_core::model::format::image_label(base)
+            );
+        }
+    }
+    println!(
+        "  {derivations} derivations found among {} images",
+        images.len()
+    );
+
+    // base_of and derived_from must be exact duals, whatever the real data looks like.
+    for image in &images {
+        for child in relations::derived_from(image, &images, &layers) {
+            assert_eq!(
+                relations::base_of(child, &images, &layers).map(|base| &base.id),
+                Some(&image.id),
+                "{} listed {} as derived, but that is not its base",
+                image.id,
+                child.id
+            );
+        }
+        // Nothing is its own ancestor.
+        assert!(
+            relations::base_of(image, &images, &layers).is_none_or(|base| base.id != image.id),
+            "{} was reported as its own base",
+            image.id
+        );
+    }
+
+    println!("\n== containers and the images they run ==");
+    for container in &containers {
+        let running = relations::running_image(container, &images);
+        let moved = relations::tag_has_moved(container, &images);
+        println!(
+            "  {:<28} {:<34} {}",
+            lave_core::model::format::container_label(container),
+            container.image,
+            match (running, moved) {
+                (Some(_), false) => "image present, tag agrees".to_owned(),
+                (Some(_), true) => "TAG HAS MOVED since this container was created".to_owned(),
+                (None, _) => "image no longer present".to_owned(),
+            }
+        );
+
+        // Whenever a tag has moved, both images must be distinct and both reachable.
+        if moved {
+            let tagged = relations::tagged_image(container, &images).expect("tag resolves");
+            assert_ne!(
+                tagged.id, container.image_id,
+                "a moved tag must name a different image"
+            );
+        }
+    }
+
+    // Every container the daemon lists is accounted for by exactly one image, or none.
+    for image in &images {
+        for container in relations::containers_of(image, &containers) {
+            assert_eq!(container.image_id, image.id);
         }
     }
 }

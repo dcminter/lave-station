@@ -11,3 +11,44 @@
   color: @window_fg_color;
   opacity: 0.6;
 }
+
+/* Icon tones. State is carried by icon shape and by text as well, so nothing here is
+   the sole conveyor of meaning — this is reinforcement, not the signal itself. */
+
+.tone-good {
+  color: @success_color;
+}
+
+.tone-warn {
+  color: @warning_color;
+}
+
+.tone-bad {
+  color: @error_color;
+}
+
+.tone-neutral {
+  opacity: 0.7;
+}
+
+/* Category colours, for the three standing nodes. These are literals rather than
+   Adwaita named colours: Docker's blue is a brand, and the palette has no pastels
+   distinct enough from the state colours above. All three are mid-tone, so they hold
+   up against a light and a dark sidebar alike. */
+
+.tone-brand {
+  color: #2496ed;
+}
+
+.tone-images {
+  color: #9a86d4;
+}
+
+.tone-containers {
+  color: #5fb6b0;
+}
+
+/* The cell of a table row that names the object, so the icon lines up with the text. */
+.table-cell {
+  padding: 2px 6px;
+}

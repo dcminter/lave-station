@@ -1,5 +1,7 @@
 //! A test double for [`ContainerEngine`], so consumers can be tested without a daemon.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
 
@@ -14,6 +16,7 @@ pub struct FakeEngine {
     containers: Vec<ContainerSummary>,
     events: Vec<EngineEvent>,
     inspect: Option<serde_json::Value>,
+    layers: BTreeMap<String, Vec<String>>,
     failure: Option<EngineError>,
 }
 
@@ -50,6 +53,12 @@ impl FakeEngine {
     #[must_use]
     pub fn with_inspect(mut self, inspect: serde_json::Value) -> Self {
         self.inspect = Some(inspect);
+        self
+    }
+
+    #[must_use]
+    pub fn with_layers(mut self, image_id: &str, layers: Vec<String>) -> Self {
+        self.layers.insert(image_id.to_owned(), layers);
         self
     }
 
@@ -90,6 +99,11 @@ impl ContainerEngine for FakeEngine {
         self.inspect.clone().ok_or_else(|| EngineError::NotFound {
             what: format!("image {id}"),
         })
+    }
+
+    async fn image_layers(&self, id: &str) -> Result<Vec<String>, EngineError> {
+        self.check()?;
+        Ok(self.layers.get(id).cloned().unwrap_or_default())
     }
 
     async fn inspect_container(&self, id: &str) -> Result<serde_json::Value, EngineError> {

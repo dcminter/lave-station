@@ -106,15 +106,29 @@ pub fn port(mapping: &PortMapping) -> String {
     }
 }
 
-/// How an image is named in the tree.
+/// The tag an image is filed under: the alphabetically first real one, so a
+/// multi-tagged image sorts and titles predictably rather than by the daemon's order.
 #[must_use]
-pub fn image_label(image: &ImageSummary) -> String {
+pub fn primary_tag(image: &ImageSummary) -> Option<String> {
     image
         .repo_tags
         .iter()
-        .find(|tag| !tag.is_empty() && *tag != UNTAGGED)
+        .filter(|tag| !tag.is_empty() && tag.as_str() != UNTAGGED)
+        .min_by_key(|tag| tag.to_lowercase())
         .cloned()
-        .unwrap_or_else(|| UNTAGGED.to_owned())
+}
+
+/// How an image is named in the tree: its tag, or its short ID when it has none.
+#[must_use]
+pub fn image_label(image: &ImageSummary) -> String {
+    primary_tag(image).unwrap_or_else(|| short_id(&image.id))
+}
+
+/// Whether an image has no usable tag. Such images are usually the residue of a tag
+/// being moved by a later pull or build.
+#[must_use]
+pub fn is_untagged(image: &ImageSummary) -> bool {
+    primary_tag(image).is_none()
 }
 
 /// How a container is named in the tree. Docker allows a container to have no name.
@@ -269,28 +283,52 @@ mod tests {
     }
 
     #[test]
-    fn an_image_is_labelled_by_its_first_real_tag() {
+    fn an_image_is_labelled_by_its_alphabetically_first_tag() {
+        // The daemon's ordering is not dependable, so the choice must not depend on it.
         let tagged = ImageSummary {
-            repo_tags: vec!["nginx:1.27".to_owned(), "nginx:latest".to_owned()],
+            repo_tags: vec!["nginx:latest".to_owned(), "nginx:1.27".to_owned()],
             ..ImageSummary::default()
         };
         assert_eq!(image_label(&tagged), "nginx:1.27");
+        assert_eq!(primary_tag(&tagged).as_deref(), Some("nginx:1.27"));
     }
 
     #[test]
-    fn an_untagged_image_says_so_rather_than_rendering_blank() {
+    fn tag_choice_ignores_case_so_capitals_do_not_sort_first() {
+        let tagged = ImageSummary {
+            repo_tags: vec!["Zebra:latest".to_owned(), "alpine:3.20".to_owned()],
+            ..ImageSummary::default()
+        };
+        assert_eq!(image_label(&tagged), "alpine:3.20");
+    }
+
+    #[test]
+    fn an_untagged_image_is_labelled_by_its_short_id() {
         let untagged = ImageSummary {
             id: "sha256:abcdef1234567890".to_owned(),
             repo_tags: vec![],
             ..ImageSummary::default()
         };
-        assert_eq!(image_label(&untagged), UNTAGGED);
+        assert_eq!(image_label(&untagged), "abcdef123456");
+        assert!(is_untagged(&untagged));
 
+        // Docker's own placeholder is not a tag.
         let placeholder = ImageSummary {
+            id: "sha256:abcdef1234567890".to_owned(),
             repo_tags: vec![UNTAGGED.to_owned()],
             ..ImageSummary::default()
         };
-        assert_eq!(image_label(&placeholder), UNTAGGED);
+        assert_eq!(image_label(&placeholder), "abcdef123456");
+        assert!(is_untagged(&placeholder));
+    }
+
+    #[test]
+    fn a_tagged_image_is_not_reported_as_untagged() {
+        let tagged = ImageSummary {
+            repo_tags: vec!["nginx:1.27".to_owned()],
+            ..ImageSummary::default()
+        };
+        assert!(!is_untagged(&tagged));
     }
 
     #[test]

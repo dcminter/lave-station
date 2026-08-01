@@ -18,94 +18,124 @@
 
   <template class="LaveWindow" parent="AdwApplicationWindow">
     <property name="title" translatable="yes">Lave Station</property>
-    <property name="default-width">1000</property>
-    <property name="default-height">700</property>
+    <property name="default-width">1200</property>
+    <property name="default-height">760</property>
     <property name="content">
       <object class="AdwToastOverlay" id="toasts">
         <property name="child">
-          <object class="AdwNavigationSplitView" id="split_view">
-            <property name="min-sidebar-width">240</property>
-            <property name="sidebar">
-              <object class="AdwNavigationPage">
-                <property name="title" translatable="yes">Lave Station</property>
-                <property name="child">
-                  <object class="AdwToolbarView">
-                    <child type="top">
-                      <object class="AdwHeaderBar">
-                        <child type="end">
-                          <object class="GtkMenuButton" id="menu_button">
-                            <property name="icon-name">open-menu-symbolic</property>
-                            <property name="tooltip-text" translatable="yes">Main menu</property>
-                            <property name="menu-model">primary_menu</property>
-                            <property name="primary">true</property>
-                            <accessibility>
-                              <property name="label" translatable="yes">Main menu</property>
-                            </accessibility>
-                          </object>
-                        </child>
-                      </object>
-                    </child>
-                    <property name="content">
-                      <object class="GtkScrolledWindow">
-                        <property name="hscrollbar-policy">never</property>
-                        <property name="child">
-                          <object class="GtkListView" id="tree_view">
-                            <property name="show-separators">false</property>
-                            <style>
-                              <class name="navigation-sidebar"/>
-                            </style>
-                            <accessibility>
-                              <property name="label" translatable="yes">Docker objects</property>
-                            </accessibility>
-                          </object>
-                        </property>
+          <object class="AdwToolbarView">
+            <child type="top">
+              <object class="AdwHeaderBar">
+                <property name="title-widget">
+                  <object class="AdwWindowTitle" id="window_title">
+                    <property name="title" translatable="yes">Lave Station</property>
+                  </object>
+                </property>
+                <child type="end">
+                  <object class="GtkMenuButton" id="menu_button">
+                    <property name="icon-name">open-menu-symbolic</property>
+                    <property name="tooltip-text" translatable="yes">Main menu</property>
+                    <property name="menu-model">primary_menu</property>
+                    <property name="primary">true</property>
+                    <accessibility>
+                      <property name="label" translatable="yes">Main menu</property>
+                    </accessibility>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <property name="content">
+              <!-- GtkPaned rather than AdwNavigationSplitView: only Paned gives the
+                   user a divider they can actually drag. -->
+              <object class="GtkPaned" id="paned">
+                <property name="orientation">horizontal</property>
+                <property name="resize-start-child">false</property>
+                <property name="shrink-start-child">false</property>
+                <property name="shrink-end-child">false</property>
+                <property name="start-child">
+                  <object class="GtkScrolledWindow">
+                    <property name="hscrollbar-policy">never</property>
+                    <property name="width-request">180</property>
+                    <property name="child">
+                      <object class="GtkListView" id="tree_view">
+                        <property name="show-separators">false</property>
+                        <style>
+                          <class name="navigation-sidebar"/>
+                        </style>
+                        <accessibility>
+                          <property name="label" translatable="yes">Docker objects</property>
+                        </accessibility>
                       </object>
                     </property>
                   </object>
                 </property>
-              </object>
-            </property>
-            <property name="content">
-              <object class="AdwNavigationPage" id="content_page">
-                <property name="title" translatable="yes">Docker</property>
-                <property name="child">
-                  <object class="AdwToolbarView">
-                    <child type="top">
-                      <object class="AdwHeaderBar"/>
-                    </child>
-                    <property name="content">
-                      <object class="GtkStack" id="content_stack">
-                        <child>
-                          <object class="GtkStackPage">
-                            <property name="name">detail</property>
-                            <property name="child">
-                              <object class="AdwPreferencesPage" id="detail_page"/>
+                <property name="end-child">
+                  <object class="GtkStack" id="content_stack">
+                    <property name="width-request">420</property>
+                    <child>
+                      <object class="GtkStackPage">
+                        <property name="name">detail</property>
+                        <property name="child">
+                          <!-- A leading table gets its own half, sized to the running
+                               containers and draggable for the rest. Pages without one
+                               hide the top half entirely. -->
+                          <object class="GtkPaned" id="detail_paned">
+                            <property name="orientation">vertical</property>
+                            <property name="resize-start-child">false</property>
+                            <property name="shrink-start-child">false</property>
+                            <property name="shrink-end-child">false</property>
+                            <property name="start-child">
+                              <object class="GtkBox" id="lead_box">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">12</property>
+                                <property name="margin-top">18</property>
+                                <property name="margin-start">18</property>
+                                <property name="margin-end">18</property>
+                                <property name="margin-bottom">6</property>
+                              </object>
                             </property>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkStackPage">
-                            <property name="name">status</property>
-                            <property name="child">
-                              <object class="AdwStatusPage" id="status_page">
-                                <property name="icon-name">network-offline-symbolic</property>
-                                <property name="title" translatable="yes">Connecting</property>
+                            <property name="end-child">
+                              <object class="GtkScrolledWindow">
+                                <property name="hscrollbar-policy">never</property>
                                 <property name="child">
-                                  <object class="GtkButton" id="retry_button">
-                                    <property name="label" translatable="yes">Try Again</property>
-                                    <property name="halign">center</property>
-                                    <style>
-                                      <class name="suggested-action"/>
-                                      <class name="pill"/>
-                                    </style>
+                                  <!-- Unclamped: tables span the full width, and the
+                                       groups clamp themselves. -->
+                                  <object class="GtkBox" id="detail_box">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">18</property>
+                                    <property name="margin-top">18</property>
+                                    <property name="margin-bottom">18</property>
+                                    <property name="margin-start">18</property>
+                                    <property name="margin-end">18</property>
                                   </object>
                                 </property>
                               </object>
                             </property>
                           </object>
-                        </child>
+                        </property>
                       </object>
-                    </property>
+                    </child>
+                    <child>
+                      <object class="GtkStackPage">
+                        <property name="name">status</property>
+                        <property name="child">
+                          <object class="AdwStatusPage" id="status_page">
+                            <property name="icon-name">network-offline-symbolic</property>
+                            <property name="title" translatable="yes">Connecting</property>
+                            <property name="child">
+                              <object class="GtkButton" id="retry_button">
+                                <property name="label" translatable="yes">Try Again</property>
+                                <property name="halign">center</property>
+                                <style>
+                                  <class name="suggested-action"/>
+                                  <class name="pill"/>
+                                </style>
+                              </object>
+                            </property>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
                   </object>
                 </property>
               </object>

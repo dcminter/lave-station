@@ -3,4 +3,6 @@
 
 pub mod detail;
 pub mod format;
+pub mod relations;
+pub mod table;
 pub mod tree;

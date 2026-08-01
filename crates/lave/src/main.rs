@@ -5,6 +5,7 @@ mod background;
 mod detail_pane;
 mod indicator_tray;
 mod runtime;
+mod table_view;
 mod tree_node;
 mod window;
 

@@ -21,6 +21,9 @@ mod imp {
         pub detail: RefCell<String>,
         #[property(get, set)]
         pub icon: RefCell<String>,
+        /// CSS class carrying the icon's colour.
+        #[property(get, set)]
+        pub tone: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -51,5 +54,6 @@ impl TreeNodeObject {
         self.set_label(node.label.clone());
         self.set_detail(node.detail.clone().unwrap_or_default());
         self.set_icon(node.icon);
+        self.set_tone(node.tone.css_class());
     }
 }

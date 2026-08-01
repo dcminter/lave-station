@@ -7,3 +7,4 @@ pub mod endpoint;
 pub mod engine;
 pub mod indicator;
 pub mod model;
+pub mod settings;

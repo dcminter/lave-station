@@ -8,7 +8,7 @@ use async_channel::Sender;
 use ksni::menu::StandardItem;
 use ksni::{Tray, TrayMethods};
 use lave_core::activity::Activity;
-use lave_core::indicator::{self, Counts, IndicatorModel, MenuAction, MenuItem};
+use lave_core::indicator::{self, Counts, IndicatorModel, IndicatorStatus, MenuAction, MenuItem};
 
 use crate::runtime::Update;
 
@@ -32,6 +32,16 @@ impl Tray for LaveTray {
 
     /// Stock Adwaita names, so the icon resolves without installing the app.
     fn icon_name(&self) -> String {
+        self.model.icon.icon_name().to_owned()
+    }
+
+    fn status(&self) -> ksni::Status {
+        status(self.model.status)
+    }
+
+    /// Hosts show this *instead of* `icon_name` while attention is wanted, so leaving it
+    /// unset would blank the indicator at the one moment it matters.
+    fn attention_icon_name(&self) -> String {
         self.model.icon.icon_name().to_owned()
     }
 
@@ -82,6 +92,14 @@ impl LaveTray {
         if self.updates.try_send(update).is_err() {
             tracing::warn!("the window is no longer listening to the indicator");
         }
+    }
+}
+
+/// The panel decides what emphasis means; we only say whether it is warranted.
+fn status(status: IndicatorStatus) -> ksni::Status {
+    match status {
+        IndicatorStatus::Active => ksni::Status::Active,
+        IndicatorStatus::NeedsAttention => ksni::Status::NeedsAttention,
     }
 }
 
@@ -147,6 +165,15 @@ async fn host_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_unrecoverable_failure_is_escalated_to_the_panel() {
+        assert_eq!(status(IndicatorStatus::Active), ksni::Status::Active);
+        assert_eq!(
+            status(IndicatorStatus::NeedsAttention),
+            ksni::Status::NeedsAttention
+        );
+    }
 
     #[test]
     fn underscores_in_labels_survive_the_menu() {

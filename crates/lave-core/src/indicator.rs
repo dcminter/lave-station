@@ -26,6 +26,28 @@ impl IndicatorIcon {
             IndicatorIcon::Failed => "dialog-warning-symbolic",
         }
     }
+
+    /// Only a failure wants the user: the others either resolve themselves or are
+    /// already in hand, and a panel that shouts about every reconnect is one the user
+    /// learns to ignore.
+    #[must_use]
+    pub fn status(self) -> IndicatorStatus {
+        match self {
+            IndicatorIcon::Connected | IndicatorIcon::Connecting | IndicatorIcon::Reconnecting => {
+                IndicatorStatus::Active
+            }
+            IndicatorIcon::Failed => IndicatorStatus::NeedsAttention,
+        }
+    }
+}
+
+/// How much the panel should make of the item. Distinct from [`IndicatorIcon`]: the icon
+/// says what is happening, this says whether anything is required of the user. The panel
+/// chooses how to emphasise it, so this follows the desktop rather than imposing on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicatorStatus {
+    Active,
+    NeedsAttention,
 }
 
 /// Menu entries the user can invoke.
@@ -57,6 +79,7 @@ pub struct Counts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndicatorModel {
     pub icon: IndicatorIcon,
+    pub status: IndicatorStatus,
     pub tooltip: String,
     pub items: Vec<MenuItem>,
 }
@@ -103,6 +126,7 @@ pub fn model(activity: &Activity, counts: Counts) -> IndicatorModel {
 
     IndicatorModel {
         icon,
+        status: icon.status(),
         tooltip: format!("Lave Station \u{2014} {status}"),
         items,
     }
@@ -263,6 +287,36 @@ mod tests {
         }));
 
         assert!(labels(&model(&activity, counts())).contains(&"container start: web".to_owned()));
+    }
+
+    #[test]
+    fn a_failure_asks_the_panel_for_attention_because_only_the_user_can_fix_it() {
+        let mut activity = Activity::new();
+        activity.apply(Signal::Lost(EngineError::Protocol("bad frame".to_owned())));
+
+        assert_eq!(
+            model(&activity, counts()).status,
+            IndicatorStatus::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn states_that_resolve_themselves_do_not_nag() {
+        let mut reconnecting = Activity::new();
+        reconnecting.apply(Signal::Lost(EngineError::unreachable(
+            Path::new("/var/run/docker.sock"),
+            ErrorKind::ConnectionRefused,
+        )));
+
+        for activity in [Activity::new(), connected(), reconnecting] {
+            let model = model(&activity, counts());
+            assert_eq!(
+                model.status,
+                IndicatorStatus::Active,
+                "{:?} should not demand attention",
+                activity.state()
+            );
+        }
     }
 
     #[test]

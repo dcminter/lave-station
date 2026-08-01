@@ -27,6 +27,18 @@ pub fn run(cli: &Cli) -> glib::ExitCode {
     let want_indicator = !cli.no_indicator;
     let existing: Rc<RefCell<Option<LaveWindow>>> = Rc::new(RefCell::new(None));
 
+    // Quitting from the menu or the tray never emits close-request, so the sidebar
+    // width has to be captured here as well as on window close.
+    application.connect_shutdown(glib::clone!(
+        #[strong]
+        existing,
+        move |_| {
+            if let Some(window) = existing.borrow().as_ref() {
+                window.store_sidebar_width();
+            }
+        }
+    ));
+
     application.connect_activate(move |application| {
         if let Some(window) = existing.borrow().as_ref() {
             window.present();
