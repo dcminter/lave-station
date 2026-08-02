@@ -21,6 +21,8 @@ pub fn run(cli: &Cli) -> glib::ExitCode {
     application.connect_startup(|application| {
         setup_actions(application);
         load_style();
+        // Empty mount points left by a run that did not unmount cleanly.
+        crate::fuse_mount::sweep_stale_mounts();
     });
 
     let docker_host = cli.docker_host.clone();
@@ -35,6 +37,8 @@ pub fn run(cli: &Cli) -> glib::ExitCode {
         move |_| {
             if let Some(window) = existing.borrow().as_ref() {
                 window.store_sidebar_width();
+                // Unmount while there is still a program to do it in.
+                window.release_mounts();
             }
         }
     ));
@@ -71,6 +75,33 @@ fn consume_updates(application: &adw::Application, window: &LaveWindow, updates:
                     Update::Snapshot(snapshot) => window.apply_snapshot(*snapshot),
                     Update::Inspected { id, raw } => window.apply_inspect(&id, *raw),
                     Update::Status(status) => window.apply_status(&status),
+                    Update::ActionOutcome { message, failed } => {
+                        window.apply_action_outcome(&message, failed);
+                    }
+                    Update::Dockerfile {
+                        image_id,
+                        title,
+                        text,
+                    } => {
+                        window.apply_dockerfile(&image_id, &title, &text);
+                    }
+                    Update::LogLines {
+                        container_id,
+                        lines,
+                        dropped,
+                    } => {
+                        window.apply_log_lines(&container_id, &lines, dropped);
+                    }
+                    Update::LogsEnded { error } => {
+                        window.apply_logs_ended(error.as_deref());
+                    }
+                    Update::Listing {
+                        path,
+                        entries,
+                        notice,
+                    } => {
+                        window.apply_listing(&path, &entries, notice.as_deref());
+                    }
                     Update::IndicatorAvailable(available) => {
                         window.set_indicator_available(available);
                     }

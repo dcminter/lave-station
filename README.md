@@ -8,6 +8,8 @@ Version 1 (implemented — see [the plan](./docs/iteration_1_plan.md)) - the ess
 
 Version 2 (implemented — see [the plan](./docs/iteration_2_plan.md)) - spit and polish; the left hand tree panel is resizeable by dragging its divider, and the width is remembered between runs. The state icons carry colour as well as shape and text - green for running, red for stopped, amber for anything in between - and the three standing nodes are coloured for identity: Docker blue for the daemon, soft violet for Images, soft teal for Containers. Images are titled by tag alone, falling back to the short ID only when there is no tag, and are sorted by tag with the untagged ones following in descending order of age; containers are titled and sorted by name. The root node's panel is led by a full-width table of containers with the columns `docker ps` reports, toggleable between running-only and everything, sortable by any column and sorted by creation date by default - with the toggle and the sort order both remembered between runs. That table opens sized to fit the running containers, up to twenty of them, and has a draggable divider beneath it for reaching the rest. The Images and Containers nodes likewise render as sortable tables, and the single-object pages lay their groups out in two columns when the window is wide enough. Finally, the relationship between containers and images is made visible and navigable in all three of the senses in which it exists - one image to many containers, a tag that has moved out from under a running container, and one image derived from another.
 
+Version 3 (in progress — see [the plan](./docs/iteration_3_plan.md)) - interaction; right-clicking anything in the tree offers what can be done to it. Containers can be started, stopped, restarted, paused and killed, and containers and images can be removed; pruning lives in the application menu, since it acts on the daemon rather than on a selection. Reversible actions act immediately; anything that loses data confirms first, naming what goes and listing every object a prune would remove. Output opens as tabs beside the metadata rather than in dialogs, one per object, so several can be kept in view at once: a container's logs stream in with stderr distinguished, its filesystem appears as a tree that expands in place, and an image's Dockerfile is reconstructed from the build history - `FROM` line included, resolved through Version 2's layer analysis. A container's filesystem can also be mounted read-only over FUSE and handed to the desktop's own file manager. An image's filesystem is reached through a labelled container created from it and never started.
+
 ## The image relationships
 
 An image is not a set of layered images. Since Docker 1.10 it is a config document
@@ -62,6 +64,23 @@ The indicator's icon is monochrome, because panels paint symbolic icons in their
 foreground colour. When the connection is lost in a way retrying will not fix, the item
 is marked `NeedsAttention` and the panel emphasises it however that desktop does — a
 transient reconnect does not, since the application is already handling it.
+
+## Browsing a container in your file manager
+
+Selecting a container and choosing **Open in Files** mounts its filesystem read-only
+under `$XDG_RUNTIME_DIR/lave-station/` and hands the directory to whatever the desktop
+uses to browse directories, via the XDG Desktop Portal where there is one. This needs
+`fusermount3`, which is in the `fuse3` package:
+
+```
+sudo apt install fuse3
+```
+
+No `libfuse3-dev` is required: the FUSE protocol is spoken directly.
+
+The mount is lazy — nothing is transferred until something is read — and read-only
+throughout. Mounts last until the application exits. An image is browsed in the window
+rather than mounted, since it needs a stand-in container first.
 
 ## Installing for a test run
 

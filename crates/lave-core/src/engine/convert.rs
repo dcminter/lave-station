@@ -201,6 +201,15 @@ fn enum_or_unknown(value: Option<String>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// The archive endpoint reports times as RFC 3339, unlike the listings' epoch seconds.
+/// An unparseable or absent time becomes 0 rather than an error: a file whose mtime we
+/// cannot read is still a file worth listing.
+pub fn epoch_seconds(value: Option<&str>) -> i64 {
+    value
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map_or(0, |time| time.timestamp())
+}
+
 #[cfg(test)]
 mod tests {
     // expect is fine in tests; a failed assumption should abort the test.

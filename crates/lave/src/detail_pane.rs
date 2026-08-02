@@ -21,6 +21,8 @@ pub struct Handlers {
     pub set_show_stopped: Rc<dyn Fn(bool)>,
     /// A table was re-sorted by the user.
     pub sort_changed: Rc<dyn Fn(SortOrder)>,
+    /// A table row was right-clicked: offer that object's actions.
+    pub context: Rc<dyn Fn(NodeId, gtk::Widget, f64, f64)>,
 }
 
 /// Replace the pane's contents.
@@ -95,6 +97,7 @@ fn table_section(
         sort,
         Rc::clone(&handlers.navigate),
         Rc::clone(&handlers.sort_changed),
+        &handlers.context,
     );
 
     let frame = gtk::Frame::new(None);

@@ -107,13 +107,15 @@ pub struct SortOrder {
 ///
 /// `on_activate` fires when a row is chosen, which is how the tables navigate to an
 /// object. `on_sort_changed` reports the user re-sorting, so the choice can be stored;
-/// it does not fire for the initial sort applied here.
+/// it does not fire for the initial sort applied here. `on_context` fires on a
+/// secondary click, carrying the cell that was hit so a menu can be anchored to it.
 #[must_use]
 pub fn build(
     table: &Table,
     sort: &SortOrder,
     on_activate: Rc<dyn Fn(NodeId)>,
     on_sort_changed: Rc<dyn Fn(SortOrder)>,
+    on_context: &Rc<dyn Fn(NodeId, gtk::Widget, f64, f64)>,
 ) -> gtk::ColumnView {
     let store = gtk::gio::ListStore::new::<TableRowObject>();
     let objects: Vec<TableRowObject> = table
@@ -138,7 +140,7 @@ pub fn build(
     view.set_model(Some(&selection));
 
     for (index, column) in table.columns.iter().enumerate() {
-        view.append_column(&build_column(index, column));
+        view.append_column(&build_column(index, column, on_context));
     }
 
     apply_sort(&view, sort);
@@ -159,6 +161,19 @@ pub fn build(
     });
 
     view
+}
+
+/// Drop the gestures `bind` attached, so a recycled cell starts clean.
+fn clear_gestures(child: &gtk::Widget) {
+    let controllers = child.observe_controllers();
+    // Collected first: removing while iterating the live model would skip entries.
+    let gestures: Vec<gtk::GestureClick> = (0..controllers.n_items())
+        .filter_map(|index| controllers.item(index).and_downcast::<gtk::GestureClick>())
+        .collect();
+
+    for gesture in gestures {
+        child.remove_controller(&gesture);
+    }
 }
 
 /// Restore a stored sort. A column title that no longer exists is simply not applied.
@@ -207,7 +222,11 @@ fn watch_sort(view: &gtk::ColumnView, on_sort_changed: Rc<dyn Fn(SortOrder)>) {
     });
 }
 
-fn build_column(index: usize, column: &lave_core::model::table::Column) -> gtk::ColumnViewColumn {
+fn build_column(
+    index: usize,
+    column: &lave_core::model::table::Column,
+    on_context: &Rc<dyn Fn(NodeId, gtk::Widget, f64, f64)>,
+) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     let numeric = column.numeric;
     // Only the first column names the object, so only it carries the icon.
@@ -238,6 +257,7 @@ fn build_column(index: usize, column: &lave_core::model::table::Column) -> gtk::
         }
     });
 
+    let on_context = Rc::clone(on_context);
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -248,6 +268,22 @@ fn build_column(index: usize, column: &lave_core::model::table::Column) -> gtk::
         let Some(child) = item.child() else {
             return;
         };
+
+        // Attached here rather than in setup because only now is the row known, and
+        // removed again in unbind so a recycled cell does not accumulate gestures.
+        // `ColumnViewRow` would be the natural home but is not a widget, so cannot
+        // carry a controller.
+        if let Some(node) = row.key() {
+            let secondary = gtk::GestureClick::new();
+            secondary.set_button(gtk::gdk::BUTTON_SECONDARY);
+            let on_context = Rc::clone(&on_context);
+            secondary.connect_pressed(move |gesture, _, x, y| {
+                if let Some(widget) = gesture.widget() {
+                    on_context(node.clone(), widget, x, y);
+                }
+            });
+            child.add_controller(secondary);
+        }
 
         let label = if with_icon {
             let Some(content) = child.downcast_ref::<gtk::Box>() else {
@@ -267,6 +303,14 @@ fn build_column(index: usize, column: &lave_core::model::table::Column) -> gtk::
             let text = row.cell_text(index);
             label.set_tooltip_text(Some(&text));
             label.set_label(&text);
+        }
+    });
+
+    factory.connect_unbind(|_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>()
+            && let Some(child) = item.child()
+        {
+            clear_gestures(&child);
         }
     });
 

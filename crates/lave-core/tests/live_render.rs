@@ -9,7 +9,7 @@
 use lave_core::endpoint::{SystemEnv, SystemPaths, resolve};
 use lave_core::engine::{ContainerEngine, bollard_engine::BollardEngine};
 use lave_core::model::relations::{self, LayerIndex};
-use lave_core::model::{detail, tree};
+use lave_core::model::{detail, dockerfile, tree};
 
 fn utc() -> chrono::FixedOffset {
     chrono::FixedOffset::east_opt(0).expect("UTC is a valid offset")
@@ -260,4 +260,74 @@ async fn relationships_hold_together_on_real_data() {
             assert_eq!(container.image_id, image.id);
         }
     }
+}
+
+/// Reconstruct a Dockerfile from whatever the daemon actually holds.
+///
+/// The fixtures in `model::dockerfile` cover the two recorded forms; this checks the
+/// whole chain — history, base resolution by layer prefix, and the boundary between the
+/// base's records and the image's own — against real images.
+#[tokio::test]
+async fn dockerfiles_reconstruct_from_real_images() {
+    let resolved = resolve(None, &SystemEnv, &SystemPaths).expect("a daemon is reachable");
+    let engine = BollardEngine::connect(resolved.endpoint.path())
+        .await
+        .expect("connects to the daemon");
+
+    let images = engine.list_images().await.expect("images listed");
+    let mut layers = LayerIndex::new();
+    for image in &images {
+        let digests = engine
+            .image_layers(&image.id)
+            .await
+            .expect("image layers read");
+        layers.insert(&image.id, digests);
+    }
+
+    let mut reconstructed = 0;
+
+    for image in images.iter().take(6) {
+        let Ok(history) = engine.image_history(&image.id).await else {
+            continue;
+        };
+
+        let base = relations::base_of(image, &images, &layers);
+        let base_history = match base {
+            Some(base) => engine.image_history(&base.id).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let base_label = base.map(lave_core::model::format::image_label);
+
+        let result = dockerfile::reconstruct(&history, base_label.as_deref(), &base_history);
+
+        println!(
+            "\n== {} ==\n{}",
+            lave_core::model::format::image_label(image),
+            result.render()
+        );
+
+        assert!(
+            result.caveats[0].contains("not the original"),
+            "the disclaimer must lead every reconstruction"
+        );
+        assert!(
+            !result.instructions.is_empty(),
+            "an image with history should yield instructions"
+        );
+
+        // The base's own records must not be re-attributed to the derived image.
+        if base.is_some() {
+            assert!(
+                result.instructions.len() <= history.len() + 1,
+                "instructions should not exceed history plus the FROM line"
+            );
+        }
+
+        reconstructed += 1;
+    }
+
+    assert!(
+        reconstructed > 0,
+        "no image on this host had readable history"
+    );
 }

@@ -3,6 +3,8 @@
 mod application;
 mod background;
 mod detail_pane;
+mod fs_node;
+mod fuse_mount;
 mod indicator_tray;
 mod runtime;
 mod table_view;

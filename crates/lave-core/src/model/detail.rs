@@ -6,6 +6,7 @@
 use crate::endpoint::Resolved;
 use crate::engine::{ContainerState, ContainerSummary, EnvironmentSummary, ImageSummary};
 
+use super::action::{self, Offer};
 use super::format::{
     bytes, container_label, image_label, instant, is_untagged, list_or_none, port, short_id,
     text_or_unknown,
@@ -54,6 +55,8 @@ pub struct DetailPage {
     pub table_filter: Option<ContainerFilter>,
     /// Pretty-printed inspect output, shown in a collapsed expander.
     pub raw: Option<String>,
+    /// What the user may do to this object, decided in [`crate::model::action`].
+    pub actions: Vec<Offer>,
 }
 
 /// Everything a detail page needs beyond the object it is describing. Passed as one
@@ -201,6 +204,7 @@ pub fn environment(
             visible_rows: table::visible_rows(running),
         }),
         raw: raw_json(cx.raw),
+        actions: action::for_environment(cx.containers, cx.images),
     }
 }
 
@@ -324,6 +328,7 @@ pub fn images(cx: &Context<'_>) -> DetailPage {
         table_first: false,
         table_filter: None,
         raw: None,
+        actions: Vec::new(),
     }
 }
 
@@ -369,6 +374,7 @@ pub fn containers(cx: &Context<'_>) -> DetailPage {
         table_first: false,
         table_filter: None,
         raw: None,
+        actions: Vec::new(),
     }
 }
 
@@ -408,6 +414,7 @@ pub fn image(image: &ImageSummary, cx: &Context<'_>) -> DetailPage {
         table_first: false,
         table_filter: None,
         raw: raw_json(cx.raw),
+        actions: action::for_image(image, cx.containers),
     }
 }
 
@@ -539,6 +546,7 @@ pub fn container(container: &ContainerSummary, cx: &Context<'_>) -> DetailPage {
         table_first: false,
         table_filter: None,
         raw: raw_json(cx.raw),
+        actions: action::for_container(container, cx.images),
     }
 }
 
@@ -1261,6 +1269,50 @@ mod tests {
             !image(&node, &world.context())
                 .group_titles()
                 .contains(&"Related images")
+        );
+    }
+
+    #[test]
+    fn the_object_pages_carry_actions_and_the_listing_pages_do_not() {
+        let world = World::default();
+
+        // A listing is a way of choosing something, not a thing to act on; the object's
+        // own page is where its actions belong.
+        assert!(images(&world.context()).actions.is_empty());
+        assert!(containers(&world.context()).actions.is_empty());
+
+        assert!(
+            !container(&sample_container(), &world.context())
+                .actions
+                .is_empty()
+        );
+        assert!(!image(&sample_image(), &world.context()).actions.is_empty());
+    }
+
+    #[test]
+    fn the_environment_page_offers_a_prune_only_when_something_is_prunable() {
+        let idle = World::default();
+        assert!(
+            environment(&environment_summary(), &resolved(), &idle.context())
+                .actions
+                .is_empty(),
+            "nothing stopped and nothing untagged means nothing to prune"
+        );
+
+        let stopped = ContainerSummary {
+            id: "old".to_owned(),
+            names: vec!["old".to_owned()],
+            state: ContainerState::Exited,
+            ..ContainerSummary::default()
+        };
+        let world = World::default().with_containers(vec![stopped]);
+
+        let actions = environment(&environment_summary(), &resolved(), &world.context()).actions;
+
+        assert!(
+            actions
+                .iter()
+                .any(|offer| offer.action == crate::model::action::Action::PruneContainers)
         );
     }
 

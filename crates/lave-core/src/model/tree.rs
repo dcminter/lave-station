@@ -115,6 +115,22 @@ const ICON_PAUSED: &str = "media-playback-pause-symbolic";
 const ICON_STOPPED: &str = "media-playback-stop-symbolic";
 const ICON_DEAD: &str = "dialog-warning-symbolic";
 
+/// The icon a node carries in the sidebar, so tabs describing the same object can match
+/// it rather than inventing an icon of their own.
+#[must_use]
+pub fn node_icon(id: &NodeId, containers: &[ContainerSummary]) -> &'static str {
+    match id {
+        NodeId::Root => ICON_ROOT,
+        NodeId::Images => ICON_IMAGES,
+        NodeId::Containers => ICON_CONTAINERS,
+        NodeId::Image(_) => ICON_IMAGE,
+        NodeId::Container(id) => containers
+            .iter()
+            .find(|container| container.id == *id)
+            .map_or(ICON_STOPPED, |container| state_icon(&container.state)),
+    }
+}
+
 /// State is shown by icon shape and by text as well as by colour, never by colour alone.
 #[must_use]
 pub fn state_icon(state: &ContainerState) -> &'static str {

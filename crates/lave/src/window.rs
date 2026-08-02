@@ -1,5 +1,6 @@
 //! The main window: sidebar tree on the left, metadata on the right.
 
+use std::path::Path;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -8,14 +9,23 @@ use async_channel::Sender;
 use gtk::glib;
 use lave_core::activity::ActivityState;
 use lave_core::endpoint::SystemEnv;
+use lave_core::engine::LogStream;
+use lave_core::model::action::{Action, Confirmation, Offer};
 use lave_core::model::detail;
+use lave_core::model::format;
+use lave_core::model::fs_tree::Node;
+use lave_core::model::logs::{self, LogLine};
 use lave_core::model::tree::{self, NodeId, TreeNode};
 use lave_core::settings;
 
 use crate::detail_pane;
-use crate::runtime::{Command, Snapshot, StatusView, now_seconds};
+use crate::runtime::{ActionRequest, BrowseTarget, Command, Snapshot, StatusView, now_seconds};
 use crate::table_view::SortOrder;
 use crate::tree_node::TreeNodeObject;
+
+/// A confirmation lists what it will remove, scrolling past this height rather than
+/// growing the dialog off the screen.
+const CONFIRM_LIST_HEIGHT: i32 = 220;
 
 /// One table row, in pixels. GTK will not report it before the first layout, so the
 /// divider's opening position is estimated; a drag overrides the estimate either way.
@@ -66,6 +76,10 @@ mod imp {
         #[template_child]
         pub lead_box: TemplateChild<gtk::Box>,
         #[template_child]
+        pub tab_view: TemplateChild<adw::TabView>,
+        #[template_child]
+        pub tab_bar: TemplateChild<adw::TabBar>,
+        #[template_child]
         pub status_page: TemplateChild<adw::StatusPage>,
         #[template_child]
         pub retry_button: TemplateChild<gtk::Button>,
@@ -79,6 +93,27 @@ mod imp {
         pub selected: RefCell<Option<NodeId>>,
         pub raw: RefCell<HashMap<String, serde_json::Value>>,
         pub last_toast: RefCell<String>,
+        /// Log buffers by container ID, so streamed lines reach the right tab when
+        /// several are open at once.
+        pub log_buffers: RefCell<HashMap<String, gtk::TextBuffer>>,
+        /// Output tabs currently open, so re-asking for one focuses it instead of
+        /// stacking up a duplicate.
+        pub open_tabs: RefCell<HashMap<super::TabKey, adw::TabPage>>,
+        /// The offers the open context menu refers to by position, and the object it
+        /// was opened on. Held because the menu deliberately leaves the selection alone,
+        /// so the selection cannot say what is being acted on.
+        pub menu_offers: RefCell<Vec<lave_core::model::action::Offer>>,
+        pub menu_target: RefCell<Option<NodeId>>,
+        /// The context menu currently on screen, so the next one can replace it rather
+        /// than requiring a dismissing click of its own.
+        pub open_menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The open file browser, if any: what it is browsing, where it is, and the
+        /// widgets a new listing replaces.
+        pub browser: RefCell<Option<super::Browser>>,
+        /// Live FUSE mounts, keyed by container ID. Held for the session: unmounting
+        /// while a file manager is still looking at one would be rude. Dropping them
+        /// unmounts, which is why they are kept rather than detached.
+        pub mounts: RefCell<HashMap<String, crate::fuse_mount::Mount>>,
         /// Persisted view preferences, held here and written back when they change.
         pub settings: RefCell<lave_core::settings::Settings>,
         /// Where the user dragged the table divider, if they have. Session-only: each
@@ -120,6 +155,9 @@ mod imp {
         /// would leave the app unreachable, so then it really does close.
         fn close_request(&self) -> Propagation {
             self.obj().store_sidebar_width();
+            // A popover surviving into the next time the window is shown is nobody's
+            // idea of useful.
+            self.obj().close_context_menu();
 
             if self.keep_running.get() {
                 self.obj().set_visible(false);
@@ -193,6 +231,10 @@ impl LaveWindow {
                 }
             ));
 
+        self.setup_actions();
+        self.setup_menu_dismissal();
+        self.setup_tabs();
+
         // The root node is selected at startup, as the README requires.
         self.expand_root();
         self.render_detail();
@@ -256,6 +298,8 @@ impl LaveWindow {
             &snapshot.containers,
         );
 
+        self.update_prune_actions();
+
         if let Some(stores) = self.imp().stores.get() {
             stores.root_node.apply(&tree);
             stores.images_node.apply(&tree.children[0]);
@@ -316,6 +360,701 @@ impl LaveWindow {
         }
     }
 
+    /// Close the context menu when a click lands outside it.
+    ///
+    /// A modal popover would do this itself, but modality is what makes moving between
+    /// rows cost an extra click. The gesture runs in the capture phase so it fires
+    /// before the row's own handler: right-clicking a second row closes the first menu
+    /// and then opens the second, in that order.
+    fn setup_menu_dismissal(&self) {
+        let outside = gtk::GestureClick::new();
+        outside.set_button(0);
+        outside.set_propagation_phase(gtk::PropagationPhase::Capture);
+        outside.connect_pressed(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, _, x, y| {
+                let Some(popover) = window.imp().open_menu.borrow().clone() else {
+                    return;
+                };
+                // A press on the menu itself is a choice, not a dismissal.
+                let overlay = window.imp().toasts.clone();
+                let point = gtk::graphene::Point::new(
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        x as f32
+                    },
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        y as f32
+                    },
+                );
+                let inside = popover
+                    .compute_bounds(&overlay)
+                    .is_some_and(|bounds| bounds.contains_point(&point));
+                if !inside {
+                    window.close_context_menu();
+                }
+            }
+        ));
+        self.imp().toasts.add_controller(outside);
+    }
+
+    /// Register the actions the context menu and the primary menu invoke.
+    fn setup_actions(&self) {
+        // The menu is rebuilt per object, so items refer to offers by position rather
+        // than by name: the set of actions depends on what state the object is in.
+        let offer = gtk::gio::SimpleAction::new("offer", Some(glib::VariantTy::INT32));
+        offer.connect_activate(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, parameter| {
+                let Some(index) = parameter.and_then(glib::Variant::get::<i32>) else {
+                    return;
+                };
+                let chosen = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| window.imp().menu_offers.borrow().get(index).cloned());
+                let node = window.imp().menu_target.borrow().clone();
+                window.close_context_menu();
+                if let (Some(chosen), Some(node)) = (chosen, node) {
+                    window.invoke(&node, &chosen);
+                }
+            }
+        ));
+        self.add_action(&offer);
+
+        for (name, action) in [
+            ("prune-containers", Action::PruneContainers),
+            ("prune-images", Action::PruneImages),
+        ] {
+            let prune = gtk::gio::SimpleAction::new(name, None);
+            prune.connect_activate(glib::clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |_, _| window.invoke_prune(action)
+            ));
+            self.add_action(&prune);
+        }
+    }
+
+    /// Offer a prune from the primary menu, with the same preview a button gave.
+    fn invoke_prune(&self, action: Action) {
+        let borrowed = self.imp().snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return;
+        };
+
+        let offer =
+            lave_core::model::action::for_environment(&snapshot.containers, &snapshot.images)
+                .into_iter()
+                .find(|offer| offer.action == action);
+        drop(borrowed);
+
+        match offer {
+            Some(offer) => self.invoke(&NodeId::Root, &offer),
+            // The menu item is insensitive in this case, so this is belt and braces.
+            None => self.toast("There is nothing to prune"),
+        }
+    }
+
+    /// Enable each prune only when it would actually remove something.
+    fn update_prune_actions(&self) {
+        let borrowed = self.imp().snapshot.borrow();
+        let offers = borrowed.as_ref().map(|snapshot| {
+            lave_core::model::action::for_environment(&snapshot.containers, &snapshot.images)
+        });
+        drop(borrowed);
+        let offers = offers.unwrap_or_default();
+
+        for (name, action) in [
+            ("prune-containers", Action::PruneContainers),
+            ("prune-images", Action::PruneImages),
+        ] {
+            let available = offers.iter().any(|offer| offer.action == action);
+            if let Some(found) = self.lookup_action(name)
+                && let Ok(simple) = found.downcast::<gtk::gio::SimpleAction>()
+            {
+                simple.set_enabled(available);
+            }
+        }
+    }
+
+    /// Show the actions for `node` at a point within `anchor`.
+    fn show_context_menu(&self, node: &NodeId, anchor: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        // The popover hangs from the toast overlay rather than from the widget that was
+        // clicked, with the point translated into the overlay's coordinates.
+        //
+        // A table cell is not a durable anchor: the detail pane is rebuilt whenever a
+        // refresh arrives, and a popover whose parent has left the widget tree cannot be
+        // realized — which produced a GTK critical and, under broadway, a crash. The
+        // overlay is the outermost content and is never rebuilt.
+        let overlay = self.imp().toasts.clone();
+        // Widget coordinates are f32; the pointer position does not need more than that.
+        #[allow(clippy::cast_possible_truncation)]
+        let clicked = gtk::graphene::Point::new(x as f32, y as f32);
+        let Some(point) = anchor.as_ref().compute_point(&overlay, &clicked) else {
+            // Only happens if the widget has already left the tree, which is not
+            // something to open a menu about.
+            return;
+        };
+
+        let offers = self.offers_for(node);
+        if offers.is_empty() {
+            return;
+        }
+
+        let menu = gtk::gio::Menu::new();
+        let mut section = gtk::gio::Menu::new();
+        let mut previous_destructive = false;
+
+        for (index, offer) in offers.iter().enumerate() {
+            // Destructive actions get their own section, so the separator sits between
+            // "Restart" and "Remove" rather than anywhere arbitrary.
+            if offer.is_destructive() && !previous_destructive && section.n_items() > 0 {
+                menu.append_section(None, &section);
+                section = gtk::gio::Menu::new();
+            }
+            previous_destructive = offer.is_destructive();
+
+            let index = i32::try_from(index).unwrap_or(0);
+            section.append(Some(&offer.label), Some(&format!("win.offer({index})")));
+        }
+        menu.append_section(None, &section);
+
+        self.imp().menu_offers.replace(offers);
+        self.imp().menu_target.replace(Some(node.clone()));
+
+        // Replaces whatever was already showing, so moving from one row to another is
+        // one click rather than a dismiss followed by an open.
+        self.close_context_menu();
+
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(&overlay);
+        popover.set_has_arrow(false);
+        // Not modal: a modal popover takes a grab, and the click that dismisses it is
+        // swallowed by that grab instead of reaching the row underneath. Dismissal is
+        // handled explicitly below and in `setup`.
+        popover.set_autohide(false);
+
+        let dismiss = gtk::EventControllerKey::new();
+        dismiss.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    window.close_context_menu();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        ));
+        popover.add_controller(dismiss);
+        // Truncating toward zero is right here: the rectangle only has to name the pixel
+        // the pointer was over.
+        #[allow(clippy::cast_possible_truncation)]
+        let at = gtk::gdk::Rectangle::new(point.x() as i32, point.y() as i32, 1, 1);
+        popover.set_pointing_to(Some(&at));
+        popover.popup();
+        // Without the grab a modal popover would take, focus has to be asked for, or
+        // the menu could not be driven from the keyboard at all.
+        popover.grab_focus();
+
+        self.imp().open_menu.replace(Some(popover));
+    }
+
+    /// The icon this object carries in the sidebar, as a `GIcon` for a tab.
+    fn node_icon(&self, node: &NodeId) -> gtk::gio::ThemedIcon {
+        let borrowed = self.imp().snapshot.borrow();
+        let containers = borrowed
+            .as_ref()
+            .map(|snapshot| snapshot.containers.as_slice())
+            .unwrap_or_default();
+        gtk::gio::ThemedIcon::new(tree::node_icon(node, containers))
+    }
+
+    /// Dismiss the context menu, if one is showing.
+    ///
+    /// Unparenting is what stops the popover leaking: it is parented to the overlay and
+    /// would otherwise stay a child of it for the life of the window.
+    pub(crate) fn close_context_menu(&self) {
+        if let Some(popover) = self.imp().open_menu.take() {
+            popover.popdown();
+            popover.unparent();
+        }
+    }
+
+    /// What may be done to this object right now.
+    fn offers_for(&self, node: &NodeId) -> Vec<Offer> {
+        let borrowed = self.imp().snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return Vec::new();
+        };
+
+        match node {
+            NodeId::Container(id) => snapshot
+                .containers
+                .iter()
+                .find(|container| container.id == *id)
+                .map(|container| {
+                    lave_core::model::action::for_container(container, &snapshot.images)
+                })
+                .unwrap_or_default(),
+            NodeId::Image(id) => snapshot
+                .images
+                .iter()
+                .find(|image| image.id == *id)
+                .map(|image| lave_core::model::action::for_image(image, &snapshot.containers))
+                .unwrap_or_default(),
+            // The daemon's own actions are prunes, which live on the primary menu.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Bind the tab bar to the view and make the metadata page permanent.
+    fn setup_tabs(&self) {
+        let view = self.imp().tab_view.clone();
+        self.imp().tab_bar.set_view(Some(&view));
+
+        // Page zero is the metadata, added by the template. Pinning it removes its close
+        // button: it follows the selection and there is nothing sensible to close it to.
+        if let Some(page) = view.nth_page(0).into() {
+            let page: adw::TabPage = page;
+            page.set_title("Details");
+            view.set_page_pinned(&page, true);
+        }
+
+        view.connect_close_page(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, page| {
+                window.on_tab_closed(page);
+                glib::Propagation::Proceed
+            }
+        ));
+    }
+
+    /// Release whatever a closing tab was holding open.
+    fn on_tab_closed(&self, page: &adw::TabPage) {
+        let mut tabs = self.imp().open_tabs.borrow_mut();
+        let Some(key) = tabs
+            .iter()
+            .find(|(_, candidate)| *candidate == page)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        tabs.remove(&key);
+        drop(tabs);
+
+        // A follower left running against a chatty container, or a scratch container
+        // standing in for an image, would otherwise outlive the tab that wanted it.
+        match key.kind {
+            TabKind::Logs => {
+                self.imp().log_buffers.borrow_mut().remove(&key.object_id);
+                self.send(Command::StopLogs);
+            }
+            TabKind::Files => {
+                self.imp().browser.replace(None);
+                self.send(Command::StopBrowsing);
+            }
+            TabKind::Dockerfile => {}
+        }
+    }
+
+    /// Focus the tab for this object and kind, or make one from `build`.
+    fn open_tab(
+        &self,
+        key: TabKey,
+        node: &NodeId,
+        title: &str,
+        build: impl FnOnce() -> gtk::Widget,
+    ) -> Option<adw::TabPage> {
+        let view = self.imp().tab_view.clone();
+
+        // Re-asking for something already open should bring it forward, not stack up a
+        // second copy of it.
+        if let Some(existing) = self.imp().open_tabs.borrow().get(&key) {
+            view.set_selected_page(existing);
+            return None;
+        }
+
+        let page = view.append(&build());
+        page.set_title(title);
+        page.set_icon(Some(&self.node_icon(node)));
+        page.set_live_thumbnail(true);
+        view.set_selected_page(&page);
+
+        self.imp().open_tabs.borrow_mut().insert(key, page.clone());
+        Some(page)
+    }
+
+    /// Mount the selection's filesystem and hand it to the desktop's file manager.
+    ///
+    /// The hand-off is `gtk::FileLauncher`, which routes through the XDG Desktop Portal
+    /// where there is one and falls back to the session's default handler otherwise —
+    /// which is what makes this work on KDE and Xfce rather than only GNOME.
+    fn open_in_file_manager(&self, node: &NodeId) {
+        // An image needs a container to stand in for it, and that is the runtime's job;
+        // mounting one would need the scratch container's ID back here first.
+        let NodeId::Container(container_id) = node.clone() else {
+            self.toast(
+                "Only containers can be mounted so far. Use Files to browse an image \
+                 in the window.",
+            );
+            return;
+        };
+
+        let (_, label) = self.action_target(node);
+
+        if let Some(existing) = self.imp().mounts.borrow().get(&container_id) {
+            launch_file_manager(self, existing.path());
+            return;
+        }
+
+        let Some(endpoint) = self
+            .imp()
+            .snapshot
+            .borrow()
+            .as_ref()
+            .map(|snapshot| snapshot.resolved.endpoint.path().to_path_buf())
+        else {
+            self.toast("Not connected to a daemon yet");
+            return;
+        };
+
+        match crate::fuse_mount::mount(&endpoint, &container_id, &label) {
+            Ok(mount) => {
+                launch_file_manager(self, mount.path());
+                self.imp().mounts.borrow_mut().insert(container_id, mount);
+            }
+            Err(error) => {
+                self.apply_action_outcome(&format!("Could not mount {label}: {error}"), true);
+            }
+        }
+    }
+
+    /// Unmount everything before the process goes away.
+    ///
+    /// Dropping a `Mount` unmounts it, so this is really just "drop them now, while
+    /// there is still a running program to do it in".
+    pub fn release_mounts(&self) {
+        self.imp().mounts.borrow_mut().clear();
+    }
+
+    /// Open a file tree tab for the selection.
+    ///
+    /// The tree expands in place rather than drilling in. Because the archive endpoint
+    /// is recursive, the first fetch indexes the whole subtree, so expanding a directory
+    /// costs a round trip only the first time and nothing thereafter.
+    fn open_browser(&self, target: &BrowseTarget, title: &str) {
+        let object_id = match target {
+            BrowseTarget::Container(id) | BrowseTarget::Image(id) => id.clone(),
+        };
+
+        let key = TabKey {
+            kind: TabKind::Files,
+            object_id,
+        };
+
+        let root = gtk::gio::ListStore::new::<crate::fs_node::FsNodeObject>();
+        let notice = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .visible(false)
+            .margin_top(6)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        notice.add_css_class("warning");
+
+        let stores = std::collections::HashMap::from([("/".to_owned(), root.clone())]);
+        self.imp().browser.replace(Some(Browser {
+            target: target.clone(),
+            stores,
+            root: root.clone(),
+            notice: notice.clone(),
+        }));
+
+        let node = match target {
+            BrowseTarget::Container(id) => NodeId::Container(id.clone()),
+            BrowseTarget::Image(id) => NodeId::Image(id.clone()),
+        };
+        let opened = self.open_tab(key, &node, &format!("{title} \u{2014} Files"), || {
+            let tree = gtk::TreeListModel::new(root, false, false, {
+                let window = self.clone();
+                move |item| window.children_model(item)
+            });
+
+            let view = gtk::ListView::builder()
+                .model(&gtk::NoSelection::new(Some(tree)))
+                .factory(&build_fs_factory())
+                .build();
+
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&view)
+                .vexpand(true)
+                .build();
+
+            let layout = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            layout.append(&notice);
+            layout.append(&scroller);
+            layout.upcast()
+        });
+
+        if opened.is_some() {
+            self.send(Command::Browse {
+                target: target.clone(),
+                path: "/".to_owned(),
+            });
+        }
+    }
+
+    /// Supply the model for a directory's children, asking the daemon to fill it.
+    ///
+    /// `GtkTreeListModel` needs a model back immediately, so this returns an empty store
+    /// and populates it when the listing arrives.
+    fn children_model(&self, item: &glib::Object) -> Option<gtk::gio::ListModel> {
+        let node = item.downcast_ref::<crate::fs_node::FsNodeObject>()?;
+        if !node.expandable() {
+            return None;
+        }
+
+        let path = node.path();
+        // GTK calls this from inside signal emission, where a panic aborts rather than
+        // unwinds. A contended borrow means some caller is holding it across a GTK call,
+        // which is a bug — but reporting it beats taking the process down.
+        let Ok(mut borrowed) = self.imp().browser.try_borrow_mut() else {
+            tracing::error!("the file tree was asked for children while already borrowed");
+            return None;
+        };
+        let browser = borrowed.as_mut()?;
+
+        if let Some(existing) = browser.stores.get(&path) {
+            return Some(existing.clone().upcast());
+        }
+
+        let store = gtk::gio::ListStore::new::<crate::fs_node::FsNodeObject>();
+        browser.stores.insert(path.clone(), store.clone());
+        let target = browser.target.clone();
+        drop(borrowed);
+
+        self.send(Command::Browse { target, path });
+
+        Some(store.upcast())
+    }
+
+    /// Fill in a directory whose listing has arrived.
+    pub fn apply_listing(&self, path: &str, entries: &[Node], notice: Option<&str>) {
+        // The borrow is taken, used, and released *before* the splice below.
+        //
+        // Splicing emits `items-changed` synchronously, which sends GTK straight back
+        // into `children_model` to ask whether the new rows expand — and that wants the
+        // same `RefCell` mutably. Holding the borrow across the splice is a re-entrant
+        // double borrow, and because it happens inside a `nounwind` GTK callback it
+        // aborts the process rather than unwinding.
+        let store = {
+            let borrowed = self.imp().browser.borrow();
+            let Some(browser) = borrowed.as_ref() else {
+                // The tab closed while this was in flight.
+                return;
+            };
+
+            match notice {
+                Some(text) => {
+                    browser.notice.set_label(text);
+                    browser.notice.set_visible(true);
+                }
+                None => browser.notice.set_visible(false),
+            }
+
+            browser.stores.get(path).cloned()
+        };
+
+        let Some(store) = store else {
+            return;
+        };
+
+        // Directories first, then files: the usual ordering for something being walked.
+        let mut ordered: Vec<&Node> = entries.iter().collect();
+        ordered.sort_by_key(|node| (!node.kind.is_directory(), node.name.to_lowercase()));
+
+        let objects: Vec<crate::fs_node::FsNodeObject> = ordered
+            .into_iter()
+            .map(crate::fs_node::FsNodeObject::from_node)
+            .collect();
+
+        store.splice(0, store.n_items(), &objects);
+    }
+
+    /// Open a log tab for a container and start the stream.
+    fn open_logs(&self, container_id: &str, title: &str) {
+        let buffer = gtk::TextBuffer::new(None);
+        for tag in log_tags() {
+            buffer.tag_table().add(&tag);
+        }
+        self.imp()
+            .log_buffers
+            .borrow_mut()
+            .insert(container_id.to_owned(), buffer.clone());
+
+        let key = TabKey {
+            kind: TabKind::Logs,
+            object_id: container_id.to_owned(),
+        };
+        let node = NodeId::Container(container_id.to_owned());
+        let opened = self.open_tab(key, &node, &format!("{title} \u{2014} Logs"), || {
+            let view = gtk::TextView::builder()
+                .buffer(&buffer)
+                .editable(false)
+                .cursor_visible(false)
+                .monospace(true)
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .top_margin(12)
+                .bottom_margin(12)
+                .left_margin(12)
+                .right_margin(12)
+                .build();
+
+            gtk::ScrolledWindow::builder()
+                .child(&view)
+                .vexpand(true)
+                .build()
+                .upcast()
+        });
+
+        // Already open: the tab was focused rather than rebuilt, and its stream is
+        // still running, so asking for it again would restart it for nothing.
+        if opened.is_none() {
+            return;
+        }
+
+        self.send(Command::Logs {
+            container_id: container_id.to_owned(),
+            follow: true,
+        });
+    }
+
+    /// Append streamed lines, trimming as many from the top as the transcript dropped.
+    pub fn apply_log_lines(&self, container_id: &str, lines: &[LogLine], dropped: usize) {
+        let borrowed = self.imp().log_buffers.borrow();
+        let Some(buffer) = borrowed.get(container_id) else {
+            // The tab closed while these were in flight.
+            return;
+        };
+
+        for _ in 0..dropped {
+            let mut start = buffer.start_iter();
+            let mut next = start;
+            if next.forward_line() {
+                buffer.delete(&mut start, &mut next);
+            }
+        }
+
+        for line in lines {
+            let first = buffer.end_iter().offset();
+            let mut end = buffer.end_iter();
+            buffer.insert(&mut end, &format!("{}\n", line.text));
+
+            if line.stream == LogStream::Stderr {
+                let start = buffer.iter_at_offset(first);
+                let stop = buffer.end_iter();
+                buffer.apply_tag_by_name(STDERR_TAG, &start, &stop);
+            }
+
+            // Structured output is worth reading rather than scanning, so a line that is
+            // a whole JSON object gets its keys and values picked out. `highlight`
+            // returns character offsets, which is what a text buffer wants.
+            for span in logs::highlight(&line.text) {
+                let start = buffer.iter_at_offset(first + i32::try_from(span.start).unwrap_or(0));
+                let stop = buffer.iter_at_offset(first + i32::try_from(span.end).unwrap_or(0));
+                buffer.apply_tag_by_name(token_tag(span.token), &start, &stop);
+            }
+        }
+    }
+
+    /// Say why the stream stopped, but only when something went wrong: a container that
+    /// simply finished writing needs no announcement.
+    pub fn apply_logs_ended(&self, error: Option<&str>) {
+        if let Some(error) = error {
+            self.apply_action_outcome(&format!("The log stream ended: {error}"), true);
+        }
+    }
+
+    /// Show a reconstructed Dockerfile in a tab.
+    ///
+    /// Its caveats are rendered into the text as leading comments, so they travel with
+    /// it when copied out — which is the point of putting them there rather than in the
+    /// tab's chrome.
+    pub fn apply_dockerfile(&self, image_id: &str, title: &str, text: &str) {
+        let key = TabKey {
+            kind: TabKind::Dockerfile,
+            object_id: image_id.to_owned(),
+        };
+        let owned = text.to_owned();
+
+        let node = NodeId::Image(image_id.to_owned());
+        self.open_tab(key, &node, &format!("{title} \u{2014} Dockerfile"), || {
+            let view = gtk::TextView::builder()
+                .editable(false)
+                .cursor_visible(false)
+                .monospace(true)
+                .top_margin(12)
+                .bottom_margin(12)
+                .left_margin(12)
+                .right_margin(12)
+                .build();
+            view.buffer().set_text(&owned);
+
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&view)
+                .vexpand(true)
+                .build();
+
+            let copy = gtk::Button::builder()
+                .label("Copy")
+                .halign(gtk::Align::End)
+                .margin_top(6)
+                .margin_end(12)
+                .build();
+            let clipboard_text = owned.clone();
+            copy.connect_clicked(glib::clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |_| {
+                    window.clipboard().set_text(&clipboard_text);
+                    window.toast("Dockerfile copied");
+                }
+            ));
+
+            let layout = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            layout.append(&copy);
+            layout.append(&scroller);
+            layout.upcast()
+        });
+    }
+
+    /// Report what an action did. Failures persist longer, since they need reading
+    /// rather than merely noticing.
+    pub fn apply_action_outcome(&self, message: &str, failed: bool) {
+        // Bypasses `toast`'s duplicate suppression: stopping two containers in a row
+        // produces two identical messages, and swallowing the second would read as the
+        // action having done nothing.
+        let toast = adw::Toast::builder()
+            .title(message)
+            .timeout(if failed { 8 } else { 3 })
+            .build();
+        self.imp().toasts.add_toast(toast);
+    }
+
     fn toast(&self, message: &str) {
         if *self.imp().last_toast.borrow() == message {
             return;
@@ -369,6 +1108,11 @@ impl LaveWindow {
             }
             return;
         };
+
+        if let Some(details) = self.imp().tab_view.nth_page(0).into() {
+            let details: adw::TabPage = details;
+            details.set_icon(Some(&self.node_icon(&selected)));
+        }
 
         self.imp().window_title.set_title(&page.title);
         self.imp()
@@ -425,6 +1169,114 @@ impl LaveWindow {
                 let window = self.clone();
                 Rc::new(move |order| window.set_sort_order(&order))
             },
+            context: {
+                let window = self.clone();
+                Rc::new(move |node, widget, x, y| {
+                    window.show_context_menu(&node, &widget, x, y);
+                })
+            },
+        }
+    }
+
+    /// Act on a chosen menu item, confirming first when the offer says to.
+    ///
+    /// `node` is what was right-clicked, carried explicitly because opening a menu
+    /// deliberately does **not** change the selection: acting on something must not
+    /// move the panel away from whatever is being looked at.
+    fn invoke(&self, node: &NodeId, offer: &Offer) {
+        match &offer.confirmation {
+            Some(confirmation) => self.confirm_then_act(node, offer, confirmation),
+            None => self.dispatch(node, offer),
+        }
+    }
+
+    /// Ask before anything irreversible. Cancel is the default response, so a stray
+    /// Return key cannot destroy anything.
+    fn confirm_then_act(&self, node: &NodeId, offer: &Offer, confirmation: &Confirmation) {
+        let dialog = adw::AlertDialog::new(Some(&confirmation.heading), Some(&confirmation.body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("confirm", &confirmation.confirm_label);
+        dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        // A prune names every object it will remove: "and 14 others" is not a preview.
+        if !confirmation.items.is_empty() {
+            dialog.set_extra_child(Some(&confirmation_list(&confirmation.items)));
+        }
+
+        let window = self.clone();
+        let offer = offer.clone();
+        let node = node.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "confirm" {
+                window.dispatch(&node, &offer);
+            }
+        });
+
+        dialog.present(Some(self));
+    }
+
+    /// Send an agreed action to the runtime, or handle it here when it only reads.
+    fn dispatch(&self, node: &NodeId, offer: &Offer) {
+        let (_, title) = self.action_target(node);
+
+        match offer.action {
+            Action::ViewDockerfile => {
+                if let NodeId::Image(image_id) = node {
+                    self.send(Command::Dockerfile {
+                        image_id: image_id.clone(),
+                    });
+                }
+            }
+            Action::ViewLogs => {
+                if let NodeId::Container(container_id) = node {
+                    self.open_logs(container_id, &title);
+                }
+            }
+            Action::BrowseFilesystem => match node {
+                NodeId::Container(id) => {
+                    self.open_browser(&BrowseTarget::Container(id.clone()), &title);
+                }
+                NodeId::Image(id) => {
+                    self.open_browser(&BrowseTarget::Image(id.clone()), &title);
+                }
+                _ => {}
+            },
+            Action::OpenInFileManager => self.open_in_file_manager(node),
+            action => {
+                let (id, label) = self.action_target(node);
+                self.send(Command::Act(Box::new(ActionRequest { action, id, label })));
+            }
+        }
+    }
+
+    /// What a node identifies, as an ID for the daemon and a name for the user. The
+    /// prunes apply to the daemon as a whole and carry no ID.
+    fn action_target(&self, node: &NodeId) -> (String, String) {
+        let snapshot = self.imp().snapshot.borrow();
+
+        match node.clone() {
+            NodeId::Container(id) => {
+                let label = snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .containers
+                            .iter()
+                            .find(|container| container.id == id)
+                    })
+                    .map_or_else(|| format::short_id(&id), format::container_label);
+                (id, label)
+            }
+            NodeId::Image(id) => {
+                let label = snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.images.iter().find(|image| image.id == id))
+                    .map_or_else(|| format::short_id(&id), format::image_label);
+                (id, label)
+            }
+            _ => (String::new(), "the daemon".to_owned()),
         }
     }
 
@@ -612,6 +1464,31 @@ fn build_factory() -> gtk::SignalListItemFactory {
 
         let expander = gtk::TreeExpander::new();
         expander.set_child(Some(&content));
+
+        // Attached per row rather than to the list: the row already knows which object
+        // it stands for, so no coordinate-to-row mapping is needed.
+        let secondary = gtk::GestureClick::new();
+        secondary.set_button(gtk::gdk::BUTTON_SECONDARY);
+        secondary.connect_pressed(|gesture, _, x, y| {
+            let Some(expander) = gesture.widget().and_downcast::<gtk::TreeExpander>() else {
+                return;
+            };
+            let Some(window) = expander.root().and_downcast::<LaveWindow>() else {
+                return;
+            };
+            // The expander knows its own row, so the object is reachable without
+            // mapping coordinates back to a list position.
+            let Some(node) = expander
+                .list_row()
+                .and_then(|row| row.item())
+                .and_downcast::<TreeNodeObject>()
+                .and_then(|node| NodeId::from_key(&node.key()))
+            else {
+                return;
+            };
+            window.show_context_menu(&node, &expander, x, y);
+        });
+        expander.add_controller(secondary);
         item.set_child(Some(&expander));
     });
 
@@ -657,4 +1534,208 @@ fn build_factory() -> gtk::SignalListItemFactory {
     });
 
     factory
+}
+
+/// The named objects a destructive confirmation will remove.
+fn confirmation_list(items: &[String]) -> gtk::ScrolledWindow {
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
+
+    for item in items {
+        let label = gtk::Label::builder()
+            .label(item)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        label.add_css_class("monospace");
+        list.append(&label);
+    }
+
+    gtk::ScrolledWindow::builder()
+        .child(&list)
+        .max_content_height(CONFIRM_LIST_HEIGHT)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build()
+}
+
+/// The tag marking stderr in the log viewer.
+const STDERR_TAG: &str = "stderr";
+
+fn token_tag(token: logs::Token) -> &'static str {
+    match token {
+        logs::Token::Key => "json-key",
+        logs::Token::Text => "json-text",
+        logs::Token::Number => "json-number",
+        logs::Token::Literal => "json-literal",
+        logs::Token::Punctuation => "json-punctuation",
+    }
+}
+
+/// Tags for the log viewer.
+///
+/// `GtkTextTag` cannot be styled from CSS, so these colours are chosen here rather than
+/// in `style.css`, and follow the theme's light/dark setting because a palette legible
+/// on one is washed out or glaring on the other.
+fn log_tags() -> Vec<gtk::TextTag> {
+    let dark = adw::StyleManager::default().is_dark();
+
+    // Adwaita's palette, the darker shades on light backgrounds and lighter on dark.
+    let (key, text, number, literal, punctuation) = if dark {
+        ("#78aeed", "#8ff0a4", "#f9f06b", "#dc8add", "#9a9996")
+    } else {
+        ("#1c71d8", "#26a269", "#c64600", "#9141ac", "#77767b")
+    };
+
+    vec![
+        gtk::TextTag::builder()
+            .name(STDERR_TAG)
+            .weight(700)
+            .foreground(if dark { "#f66151" } else { "#c01c28" })
+            .build(),
+        gtk::TextTag::builder()
+            .name("json-key")
+            .foreground(key)
+            .weight(700)
+            .build(),
+        gtk::TextTag::builder()
+            .name("json-text")
+            .foreground(text)
+            .build(),
+        gtk::TextTag::builder()
+            .name("json-number")
+            .foreground(number)
+            .build(),
+        gtk::TextTag::builder()
+            .name("json-literal")
+            .foreground(literal)
+            .build(),
+        gtk::TextTag::builder()
+            .name("json-punctuation")
+            .foreground(punctuation)
+            .build(),
+    ]
+}
+
+/// The open file tree's state.
+pub struct Browser {
+    pub target: BrowseTarget,
+    /// One store per indexed directory, filled when its listing arrives.
+    pub stores: std::collections::HashMap<String, gtk::gio::ListStore>,
+    pub root: gtk::gio::ListStore,
+    pub notice: gtk::Label,
+}
+
+/// Rows for the file tree: an expander, an icon, the name, and its size or link target.
+fn build_fs_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+
+    factory.connect_setup(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+
+        let icon = gtk::Image::new();
+        let name = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let detail = gtk::Label::builder().xalign(1.0).hexpand(true).build();
+        detail.add_css_class("dim-label");
+        detail.add_css_class("numeric");
+
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        content.append(&icon);
+        content.append(&name);
+        content.append(&detail);
+
+        let expander = gtk::TreeExpander::new();
+        expander.set_child(Some(&content));
+        item.set_child(Some(&expander));
+    });
+
+    factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(row) = item.item().and_downcast::<gtk::TreeListRow>() else {
+            return;
+        };
+        let Some(node) = row.item().and_downcast::<crate::fs_node::FsNodeObject>() else {
+            return;
+        };
+        let Some(expander) = item.child().and_downcast::<gtk::TreeExpander>() else {
+            return;
+        };
+        expander.set_list_row(Some(&row));
+
+        let Some(content) = expander.child().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let Some(icon) = content.first_child().and_downcast::<gtk::Image>() else {
+            return;
+        };
+        let Some(name) = icon.next_sibling().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(detail) = name.next_sibling().and_downcast::<gtk::Label>() else {
+            return;
+        };
+
+        icon.set_icon_name(Some(&node.icon()));
+        name.set_label(&node.name());
+        detail.set_label(&node.detail());
+    });
+
+    factory
+}
+
+/// What an output tab shows. The metadata page is not one of these: it is pinned, and
+/// follows the selection rather than belonging to any one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TabKind {
+    Logs,
+    Dockerfile,
+    Files,
+}
+
+/// Identifies an output tab. One per object per kind, so two containers' logs can sit
+/// side by side.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TabKey {
+    pub kind: TabKind,
+    pub object_id: String,
+}
+
+/// Hand a directory to whatever the desktop uses to browse directories.
+fn launch_file_manager(window: &LaveWindow, path: &Path) {
+    let file = gtk::gio::File::for_path(path);
+    let launcher = gtk::FileLauncher::new(Some(&file));
+
+    launcher.launch(
+        Some(window),
+        gtk::gio::Cancellable::NONE,
+        glib::clone!(
+            #[weak]
+            window,
+            move |result| {
+                if let Err(error) = result {
+                    // Dismissing the portal's chooser arrives here too, and is not a
+                    // failure worth shouting about.
+                    if error.matches(gtk::gio::IOErrorEnum::Cancelled) {
+                        return;
+                    }
+                    window.apply_action_outcome(
+                        &format!("Mounted, but no file manager would open it: {error}"),
+                        true,
+                    );
+                }
+            }
+        ),
+    );
 }
