@@ -92,8 +92,11 @@ fn consume_updates(application: &adw::Application, window: &LaveWindow, updates:
                     } => {
                         window.apply_log_lines(&container_id, &lines, dropped);
                     }
-                    Update::LogsEnded { error } => {
-                        window.apply_logs_ended(error.as_deref());
+                    Update::LogsEnded {
+                        container_id,
+                        error,
+                    } => {
+                        window.apply_logs_ended(&container_id, error.as_deref());
                     }
                     Update::Listing {
                         path,

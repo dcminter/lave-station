@@ -6,6 +6,7 @@ mod detail_pane;
 mod fs_node;
 mod fuse_mount;
 mod indicator_tray;
+mod prefs;
 mod runtime;
 mod table_view;
 mod tree_node;

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="com.paperstack.LaveStation" path="/com/paperstack/LaveStation/">
+
+    <key name="sidebar-width" type="i">
+      <default>300</default>
+      <range min="180" max="900"/>
+      <summary>Width of the object sidebar</summary>
+      <description>
+        Where the divider between the sidebar and the detail pane was left. Clamped to a
+        usable range on the way in and on the way out, so neither a hand-edited value nor
+        an odd window state can wedge the sidebar shut.
+      </description>
+    </key>
+
+    <key name="show-stopped-containers" type="b">
+      <default>true</default>
+      <summary>Include stopped containers in the environment table</summary>
+      <description>
+        Corresponds to docker ps -a. With this off, only containers that are actually
+        executing are listed.
+      </description>
+    </key>
+
+    <key name="column-widths" type="a{sa{si}}">
+      <default>{}</default>
+      <summary>Widths the user dragged table columns to</summary>
+      <description>
+        Keyed by table and then by column title, in pixels. A table or column that no
+        longer exists is ignored at render time rather than removed here, so renaming a
+        column cannot make a stored value invalid. Sort order is deliberately not stored:
+        it lasts for the session only.
+      </description>
+    </key>
+
+  </schema>
+</schemalist>

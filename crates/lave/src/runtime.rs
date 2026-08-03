@@ -4,11 +4,12 @@
 //! panel indicator. Nothing here touches a widget; everything crosses as an [`Update`]
 //! consumed on the main thread.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_channel::{Receiver, Sender};
 use futures_util::StreamExt;
-use futures_util::stream::BoxStream;
+use futures_util::stream::{AbortHandle, BoxStream, SelectAll};
 use lave_core::activity::{Activity, ActivityState, Effect, Signal};
 use lave_core::endpoint::{Resolved, SystemEnv, SystemPaths, resolve};
 use lave_core::engine::{
@@ -67,17 +68,25 @@ pub enum Command {
     /// Carry out a mutating action. Confirmation, where one was required, has already
     /// happened in the window: by the time this is sent the user has agreed.
     Act(Box<ActionRequest>),
+    /// Carry out the same action across several objects, reporting once at the end.
+    ActMany(Vec<ActionRequest>),
     /// Rebuild an image's Dockerfile from its history.
     Dockerfile {
         image_id: String,
     },
-    /// Start streaming a container's logs, replacing any stream already running.
+    /// Start streaming a container's logs, replacing that container's stream if one is
+    /// already running — which is how the viewer switches between the tail and the whole
+    /// log. Other containers' streams are untouched.
     Logs {
         container_id: String,
         follow: bool,
+        /// Start from the last this-many lines; `None` for the whole log.
+        tail: Option<usize>,
     },
-    /// Stop the current log stream. Sent when the viewer closes.
-    StopLogs,
+    /// Stop one container's log stream. Sent when its tab closes.
+    StopLogs {
+        container_id: String,
+    },
     /// List a directory. For an image this creates a scratch container on first use and
     /// keeps it for the browsing session.
     Browse {
@@ -141,9 +150,10 @@ pub enum Update {
         lines: Vec<LogLine>,
         dropped: usize,
     },
-    /// The log stream ended, either because the container stopped writing or because
+    /// A log stream ended, either because the container stopped writing or because
     /// reading it failed. `error` distinguishes the two.
     LogsEnded {
+        container_id: String,
         error: Option<String>,
     },
     /// A directory listing for the file browser.
@@ -305,13 +315,13 @@ async fn session(
         }
     }
 
-    // The log stream lives in the select alongside the events, rather than in a task of
-    // its own: dropping it is the cancellation, so there is no second lifetime to
-    // manage and no way to leak a follower.
-    let mut logs: Option<BoxStream<'_, Result<LogChunk, EngineError>>> = None;
-    let mut transcript = logs_model::Transcript::default();
-    // Which container the open stream belongs to, so its lines can be addressed.
-    let mut following: String = String::new();
+    // The log streams live in the select alongside the events, rather than in tasks of
+    // their own: there is then no second lifetime to manage and no way to leak a
+    // follower. One per open viewer, since several tabs can be open at once and closing
+    // one must not silence the others.
+    let mut followers: SelectAll<BoxStream<'_, LogItem>> = SelectAll::new();
+    let mut aborts: HashMap<String, AbortHandle> = HashMap::new();
+    let mut transcripts: HashMap<String, logs_model::Transcript> = HashMap::new();
 
     // The scratch container backing an image browse, kept for as long as the browser is
     // open so that walking into a directory does not create another.
@@ -325,10 +335,8 @@ async fn session(
     loop {
         let effects = tokio::select! {
             // Only polled while a viewer is open; otherwise this branch parks forever.
-            chunk = next_log(&mut logs) => {
-                if !consume_log(chunk, &following, &mut transcript, updates).await {
-                    logs = None;
-                }
+            item = next_log(&mut followers) => {
+                consume_log(item, &mut transcripts, &mut aborts, updates).await;
                 Vec::new()
             },
             message = events.next() => match message {
@@ -349,17 +357,15 @@ async fn session(
                     dockerfile(engine, &image_id, state, updates).await;
                     Vec::new()
                 }
-                Ok(Command::Logs { container_id, follow }) => {
-                    transcript = logs_model::Transcript::default();
-                    following.clone_from(&container_id);
-                    logs = Some(engine.logs(&container_id, LogOptions {
-                        follow,
-                        ..LogOptions::default()
-                    }));
+                Ok(Command::Logs { container_id, follow, tail }) => {
+                    start_logs(
+                        engine, &container_id, follow, tail,
+                        &mut followers, &mut aborts, &mut transcripts,
+                    );
                     Vec::new()
                 }
-                Ok(Command::StopLogs) => {
-                    logs = None;
+                Ok(Command::StopLogs { container_id }) => {
+                    stop_logs(&container_id, &mut aborts, &mut transcripts);
                     Vec::new()
                 }
                 Ok(Command::Browse { target, path }) => {
@@ -376,6 +382,10 @@ async fn session(
                     act(engine, &request, updates).await;
                     // Refresh rather than waiting for the daemon's event, so a failed
                     // action still restores the pane to what is actually true.
+                    vec![Effect::Refresh]
+                }
+                Ok(Command::ActMany(requests)) => {
+                    act_many(engine, &requests, updates).await;
                     vec![Effect::Refresh]
                 }
                 Err(_) => return SessionEnd::Closed,
@@ -535,35 +545,105 @@ async fn inspect(engine: &BollardEngine, id: &NodeId, updates: &Sender<Update>) 
     }
 }
 
-/// Absorb one item from the log stream. Returns false once the stream is over, at which
-/// point the caller drops it.
-async fn consume_log(
-    chunk: Option<Result<LogChunk, EngineError>>,
+/// One item from one container's log stream: `None` marks that stream's end, and the ID
+/// is carried because several streams are multiplexed into one.
+type LogItem = (String, Option<Result<LogChunk, EngineError>>);
+
+/// Start following a container, replacing its own stream if it already had one.
+///
+/// Replacing is how the viewer switches between the tail and the whole log; every other
+/// container's stream is left alone, which is what makes several viewers work at once.
+fn start_logs<'a>(
+    engine: &'a BollardEngine,
     container_id: &str,
-    transcript: &mut logs_model::Transcript,
+    follow: bool,
+    tail: Option<usize>,
+    followers: &mut SelectAll<BoxStream<'a, LogItem>>,
+    aborts: &mut HashMap<String, AbortHandle>,
+    transcripts: &mut HashMap<String, logs_model::Transcript>,
+) {
+    stop_logs(container_id, aborts, transcripts);
+
+    let stream = engine.logs(
+        container_id,
+        LogOptions {
+            follow,
+            tail,
+            ..LogOptions::default()
+        },
+    );
+
+    // Tagged with the container, and given an explicit terminator: once the stream is
+    // merged into the others there is no other way to tell which one has finished.
+    let tag = container_id.to_owned();
+    let ending = container_id.to_owned();
+    let tagged = stream
+        .map(move |item| (tag.clone(), Some(item)))
+        .chain(futures_util::stream::once(async move { (ending, None) }));
+
+    // Aborting is what stops the transfer; a stream that has ended is dropped from the
+    // set by `SelectAll` itself.
+    let (abortable, handle) = futures_util::stream::abortable(tagged);
+    aborts.insert(container_id.to_owned(), handle);
+    transcripts.insert(container_id.to_owned(), logs_model::Transcript::default());
+    followers.push(abortable.boxed());
+}
+
+/// Stop following a container. Aborting cuts the stream before its terminator, so a
+/// deliberate stop reports nothing to the window — there is nothing to report.
+fn stop_logs(
+    container_id: &str,
+    aborts: &mut HashMap<String, AbortHandle>,
+    transcripts: &mut HashMap<String, logs_model::Transcript>,
+) {
+    if let Some(handle) = aborts.remove(container_id) {
+        handle.abort();
+    }
+    transcripts.remove(container_id);
+}
+
+/// Absorb one item from whichever stream produced it.
+async fn consume_log(
+    item: Option<LogItem>,
+    transcripts: &mut HashMap<String, logs_model::Transcript>,
+    aborts: &mut HashMap<String, AbortHandle>,
     updates: &Sender<Update>,
-) -> bool {
-    match chunk {
+) {
+    // The set drained between being polled and now; the next poll parks.
+    let Some((container_id, message)) = item else {
+        return;
+    };
+
+    match message {
         Some(Ok(chunk)) => {
-            let appended = transcript.push(&chunk);
-            send_lines(container_id, appended, updates).await;
-            true
+            if let Some(transcript) = transcripts.get_mut(&container_id) {
+                let appended = transcript.push(&chunk);
+                send_lines(&container_id, appended, updates).await;
+            }
         }
         Some(Err(error)) => {
+            stop_logs(&container_id, aborts, transcripts);
             let _ = updates
                 .send(Update::LogsEnded {
+                    container_id,
                     error: Some(error.to_string()),
                 })
                 .await;
-            false
         }
         None => {
             // The container stopped writing. Flush whatever it left without a trailing
             // newline, then say the stream is over.
-            let appended = transcript.finish();
-            send_lines(container_id, appended, updates).await;
-            let _ = updates.send(Update::LogsEnded { error: None }).await;
-            false
+            if let Some(mut transcript) = transcripts.remove(&container_id) {
+                let appended = transcript.finish();
+                send_lines(&container_id, appended, updates).await;
+            }
+            aborts.remove(&container_id);
+            let _ = updates
+                .send(Update::LogsEnded {
+                    container_id,
+                    error: None,
+                })
+                .await;
         }
     }
 }
@@ -756,17 +836,17 @@ async fn release_scratch(engine: &BollardEngine, scratch: &mut Option<Scratch>) 
     }
 }
 
-/// The next log chunk, or a future that never completes when no viewer is open.
+/// The next item from any open log stream, or a future that never completes when no
+/// viewer is open.
 ///
 /// `select!` needs every branch to be a future; parking is how a branch is disabled
-/// without a guard that would still evaluate the expression.
-async fn next_log(
-    logs: &mut Option<BoxStream<'_, Result<LogChunk, EngineError>>>,
-) -> Option<Result<LogChunk, EngineError>> {
-    match logs.as_mut() {
-        Some(stream) => stream.next().await,
-        None => std::future::pending().await,
+/// without a guard that would still evaluate the expression. An empty `SelectAll`
+/// completes immediately with `None`, which would spin the loop.
+async fn next_log(followers: &mut SelectAll<BoxStream<'_, LogItem>>) -> Option<LogItem> {
+    if followers.is_empty() {
+        return std::future::pending().await;
     }
+    followers.next().await
 }
 
 /// Rebuild an image's Dockerfile and send it to the window.
@@ -832,9 +912,65 @@ async fn dockerfile(
 /// Both outcomes are reported. A removal that failed silently would leave the user
 /// believing something is gone when it is not, which is the worst available outcome.
 async fn act(engine: &BollardEngine, request: &ActionRequest, updates: &Sender<Update>) {
+    let update = match run(engine, request).await {
+        // The read-only actions are handled in the window and never arrive here; if one
+        // did, an empty toast would be worse than saying nothing.
+        Ok(message) if message.is_empty() => return,
+        Ok(message) => Update::ActionOutcome {
+            message,
+            failed: false,
+        },
+        Err(error) => {
+            tracing::warn!("action on {} failed: {error}", request.label);
+            Update::ActionOutcome {
+                message: format!(
+                    "Could not {} {}: {error}",
+                    lave_core::model::action::verb(request.action),
+                    request.label
+                ),
+                failed: true,
+            }
+        }
+    };
+
+    let _ = updates.send(update).await;
+}
+
+/// Carry out the same action across a checked selection, reporting once.
+///
+/// Sequential rather than concurrent: the objects are related often enough — a container
+/// and the image it holds open — that racing them produces failures the user then has to
+/// reason about. A handful of local socket calls is fast enough.
+async fn act_many(engine: &BollardEngine, requests: &[ActionRequest], updates: &Sender<Update>) {
+    let Some(first) = requests.first() else {
+        return;
+    };
+
+    let mut succeeded = 0;
+    let mut failures = Vec::new();
+
+    for request in requests {
+        match run(engine, request).await {
+            Ok(_) => succeeded += 1,
+            Err(error) => {
+                tracing::warn!("action on {} failed: {error}", request.label);
+                failures.push(format!("{}: {error}", request.label));
+            }
+        }
+    }
+
+    let (message, failed) =
+        lave_core::model::action::bulk_outcome(first.action, succeeded, &failures);
+    let _ = updates
+        .send(Update::ActionOutcome { message, failed })
+        .await;
+}
+
+/// One action, returning what to say about it having worked.
+async fn run(engine: &BollardEngine, request: &ActionRequest) -> Result<String, EngineError> {
     let label = &request.label;
 
-    let outcome = match request.action {
+    match request.action {
         Action::Lifecycle(action) => engine
             .lifecycle(&request.id, action)
             .await
@@ -865,24 +1001,8 @@ async fn act(engine: &BollardEngine, request: &ActionRequest, updates: &Sender<U
         Action::ViewLogs
         | Action::ViewDockerfile
         | Action::BrowseFilesystem
-        | Action::OpenInFileManager => return,
-    };
-
-    let update = match outcome {
-        Ok(message) => Update::ActionOutcome {
-            message,
-            failed: false,
-        },
-        Err(error) => {
-            tracing::warn!("action on {label} failed: {error}");
-            Update::ActionOutcome {
-                message: format!("Could not {} {label}: {error}", verb(request.action)),
-                failed: true,
-            }
-        }
-    };
-
-    let _ = updates.send(update).await;
+        | Action::OpenInFileManager => Ok(String::new()),
+    }
 }
 
 fn past_tense(action: Lifecycle) -> &'static str {
@@ -893,17 +1013,6 @@ fn past_tense(action: Lifecycle) -> &'static str {
         Lifecycle::Pause => "paused",
         Lifecycle::Unpause => "resumed",
         Lifecycle::Kill => "killed",
-    }
-}
-
-fn verb(action: Action) -> &'static str {
-    match action {
-        Action::Lifecycle(lifecycle) => lifecycle.verb(),
-        Action::RemoveContainer { .. } | Action::RemoveImage => "remove",
-        Action::PruneContainers | Action::PruneImages => "prune",
-        Action::ViewLogs => "read the logs of",
-        Action::ViewDockerfile => "reconstruct the Dockerfile for",
-        Action::BrowseFilesystem | Action::OpenInFileManager => "open",
     }
 }
 

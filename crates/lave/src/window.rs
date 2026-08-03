@@ -3,24 +3,25 @@
 use std::path::Path;
 use std::rc::Rc;
 
+use std::collections::{BTreeMap, HashSet};
+
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use async_channel::Sender;
 use gtk::glib;
 use lave_core::activity::ActivityState;
-use lave_core::endpoint::SystemEnv;
-use lave_core::engine::LogStream;
-use lave_core::model::action::{Action, Confirmation, Offer};
+use lave_core::engine::{ContainerSummary, ImageSummary, LogStream, TAIL_LINES};
+use lave_core::model::action::{Action, BulkOffer, Confirmation, Offer};
 use lave_core::model::detail;
 use lave_core::model::format;
 use lave_core::model::fs_tree::Node;
 use lave_core::model::logs::{self, LogLine};
-use lave_core::model::tree::{self, NodeId, TreeNode};
-use lave_core::settings;
+use lave_core::model::table::Table;
+use lave_core::model::tree::{self, NodeId, Tone, TreeNode};
 
 use crate::detail_pane;
 use crate::runtime::{ActionRequest, BrowseTarget, Command, Snapshot, StatusView, now_seconds};
-use crate::table_view::SortOrder;
+use crate::table_view::{SortOrder, TableHandlers};
 use crate::tree_node::TreeNodeObject;
 
 /// A confirmation lists what it will remove, scrolling past this height rather than
@@ -35,7 +36,7 @@ const TABLE_CHROME_HEIGHT: i32 = 116;
 
 mod imp {
     use std::cell::{Cell, OnceCell, RefCell};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use adw::subclass::prelude::*;
     use async_channel::Sender;
@@ -93,9 +94,9 @@ mod imp {
         pub selected: RefCell<Option<NodeId>>,
         pub raw: RefCell<HashMap<String, serde_json::Value>>,
         pub last_toast: RefCell<String>,
-        /// Log buffers by container ID, so streamed lines reach the right tab when
+        /// Open log tabs by container ID, so streamed lines reach the right one when
         /// several are open at once.
-        pub log_buffers: RefCell<HashMap<String, gtk::TextBuffer>>,
+        pub log_views: RefCell<HashMap<String, super::LogView>>,
         /// Output tabs currently open, so re-asking for one focuses it instead of
         /// stacking up a duplicate.
         pub open_tabs: RefCell<HashMap<super::TabKey, adw::TabPage>>,
@@ -104,6 +105,17 @@ mod imp {
         /// so the selection cannot say what is being acted on.
         pub menu_offers: RefCell<Vec<lave_core::model::action::Offer>>,
         pub menu_target: RefCell<Option<NodeId>>,
+        /// The offers the cog's menu refers to by position, rebuilt each time it opens.
+        pub bulk_offers: RefCell<Vec<lave_core::model::action::BulkOffer>>,
+        /// Keys of the objects checked for a bulk action. Held here rather than in the
+        /// widgets because the pane is rebuilt on every refresh; cleared when the page
+        /// changes, since a tick made on one page has no business acting from another.
+        pub checked: RefCell<HashSet<String>>,
+        /// The bulk-action button of the page currently rendered, if it has a table.
+        pub cog: RefCell<Option<gtk::MenuButton>>,
+        /// How each table is sorted, by table id. Session-only, deliberately: the user's
+        /// order is not written to the settings store.
+        pub sorts: RefCell<HashMap<String, super::SortOrder>>,
         /// The context menu currently on screen, so the next one can replace it rather
         /// than requiring a dismissing click of its own.
         pub open_menu: RefCell<Option<gtk::PopoverMenu>>,
@@ -116,6 +128,8 @@ mod imp {
         pub mounts: RefCell<HashMap<String, crate::fuse_mount::Mount>>,
         /// Persisted view preferences, held here and written back when they change.
         pub settings: RefCell<lave_core::settings::Settings>,
+        /// Where they are actually kept.
+        pub prefs: crate::prefs::Prefs,
         /// Where the user dragged the table divider, if they have. Session-only: each
         /// launch sizes the table to the running containers afresh.
         pub lead_position: Cell<Option<i32>>,
@@ -195,7 +209,7 @@ impl LaveWindow {
         let _ = self.imp().stores.set(stores);
 
         // The divider is draggable; where the user left it last time is restored here.
-        let settings = settings::load(&SystemEnv);
+        let settings = self.imp().prefs.load();
         self.imp().paned.set_position(settings.sidebar_width);
         self.imp().settings.replace(settings);
 
@@ -308,6 +322,7 @@ impl LaveWindow {
             fill(&stores.containers, &tree.children[1].children);
         }
 
+        self.prune_checks(&snapshot);
         self.imp().snapshot.replace(Some(snapshot));
         self.restore_selection();
         self.imp().content_stack.set_visible_child_name("detail");
@@ -424,6 +439,25 @@ impl LaveWindow {
         ));
         self.add_action(&offer);
 
+        // The same arrangement for the cog, which acts on everything checked at once.
+        let bulk = gtk::gio::SimpleAction::new("bulk", Some(glib::VariantTy::INT32));
+        bulk.connect_activate(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, parameter| {
+                let Some(index) = parameter.and_then(glib::Variant::get::<i32>) else {
+                    return;
+                };
+                let chosen = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| window.imp().bulk_offers.borrow().get(index).cloned());
+                if let Some(chosen) = chosen {
+                    window.invoke_bulk(&chosen);
+                }
+            }
+        ));
+        self.add_action(&bulk);
+
         for (name, action) in [
             ("prune-containers", Action::PruneContainers),
             ("prune-images", Action::PruneImages),
@@ -504,23 +538,8 @@ impl LaveWindow {
             return;
         }
 
-        let menu = gtk::gio::Menu::new();
-        let mut section = gtk::gio::Menu::new();
-        let mut previous_destructive = false;
-
-        for (index, offer) in offers.iter().enumerate() {
-            // Destructive actions get their own section, so the separator sits between
-            // "Restart" and "Remove" rather than anywhere arbitrary.
-            if offer.is_destructive() && !previous_destructive && section.n_items() > 0 {
-                menu.append_section(None, &section);
-                section = gtk::gio::Menu::new();
-            }
-            previous_destructive = offer.is_destructive();
-
-            let index = i32::try_from(index).unwrap_or(0);
-            section.append(Some(&offer.label), Some(&format!("win.offer({index})")));
-        }
-        menu.append_section(None, &section);
+        let entries: Vec<MenuEntry> = offers.iter().map(MenuEntry::from_offer).collect();
+        let menu = build_menu(&entries, "win.offer");
 
         self.imp().menu_offers.replace(offers);
         self.imp().menu_target.replace(Some(node.clone()));
@@ -561,6 +580,7 @@ impl LaveWindow {
         // Without the grab a modal popover would take, focus has to be asked for, or
         // the menu could not be driven from the keyboard at all.
         popover.grab_focus();
+        tint_menu(popover.upcast_ref(), &entries);
 
         self.imp().open_menu.replace(Some(popover));
     }
@@ -613,6 +633,175 @@ impl LaveWindow {
         }
     }
 
+    /// Tick or untick an object for the next bulk action.
+    fn set_checked(&self, node: &NodeId, on: bool) {
+        let changed = {
+            let mut checked = self.imp().checked.borrow_mut();
+            if on {
+                checked.insert(node.key())
+            } else {
+                checked.remove(&node.key())
+            }
+        };
+
+        if changed {
+            self.update_cog();
+        }
+    }
+
+    /// Forget every tick: the page has changed, or an action has just consumed them.
+    fn clear_checks(&self) {
+        if self.imp().checked.borrow().is_empty() {
+            return;
+        }
+        self.imp().checked.borrow_mut().clear();
+        self.update_cog();
+    }
+
+    /// Drop ticks for objects that are no longer there, so a bulk action cannot be
+    /// launched against something already removed.
+    fn prune_checks(&self, snapshot: &Snapshot) {
+        let present: HashSet<String> = snapshot
+            .containers
+            .iter()
+            .map(|container| NodeId::Container(container.id.clone()).key())
+            .chain(
+                snapshot
+                    .images
+                    .iter()
+                    .map(|image| NodeId::Image(image.id.clone()).key()),
+            )
+            .collect();
+
+        let changed = {
+            let mut checked = self.imp().checked.borrow_mut();
+            let before = checked.len();
+            checked.retain(|key| present.contains(key));
+            checked.len() != before
+        };
+
+        if changed {
+            self.update_cog();
+        }
+    }
+
+    /// Take charge of a freshly rendered cog.
+    ///
+    /// Its menu is built when it opens rather than when it is created, so it always
+    /// describes what is checked at that moment rather than what was checked when the
+    /// pane was last rebuilt.
+    fn adopt_cog(&self, cog: &gtk::MenuButton) {
+        cog.set_create_popup_func(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |button| {
+                let (menu, entries, offers) = window.bulk_menu();
+                window.imp().bulk_offers.replace(offers);
+                button.set_menu_model(Some(&menu));
+
+                // The popover is built from the model after this returns, so the tinting
+                // has to wait for it.
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    button,
+                    move || {
+                        if let Some(popover) = button.popover() {
+                            tint_menu(popover.upcast_ref(), &entries);
+                        }
+                    }
+                ));
+            }
+        ));
+
+        self.imp().cog.replace(Some(cog.clone()));
+        self.update_cog();
+    }
+
+    /// The cog is insensitive until something is checked, as there is then nothing for
+    /// it to act on.
+    fn update_cog(&self) {
+        let any = !self.imp().checked.borrow().is_empty();
+
+        if let Some(cog) = self.imp().cog.borrow().as_ref() {
+            cog.set_sensitive(any);
+            cog.set_tooltip_text(Some(if any {
+                "Act on the checked rows"
+            } else {
+                "Check some rows to act on them"
+            }));
+        }
+    }
+
+    /// The cog's menu, built from what is checked right now.
+    fn bulk_menu(&self) -> (gtk::gio::Menu, Vec<MenuEntry>, Vec<BulkOffer>) {
+        let offers = self.bulk_offers();
+        let entries: Vec<MenuEntry> = offers.iter().map(MenuEntry::from_bulk).collect();
+        let menu = build_menu(&entries, "win.bulk");
+        (menu, entries, offers)
+    }
+
+    /// What may be done to the checked objects. Only those still in the listing count: a
+    /// tick that outlived its object acts on nothing.
+    fn bulk_offers(&self) -> Vec<BulkOffer> {
+        let borrowed = self.imp().snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return Vec::new();
+        };
+        let checked = self.imp().checked.borrow();
+
+        let containers: Vec<&ContainerSummary> = snapshot
+            .containers
+            .iter()
+            .filter(|container| checked.contains(&NodeId::Container(container.id.clone()).key()))
+            .collect();
+        let images: Vec<&ImageSummary> = snapshot
+            .images
+            .iter()
+            .filter(|image| checked.contains(&NodeId::Image(image.id.clone()).key()))
+            .collect();
+
+        lave_core::model::action::for_selection(
+            &containers,
+            &images,
+            &snapshot.containers,
+            &snapshot.images,
+        )
+    }
+
+    /// Act on a chosen cog item, confirming first when the offer says to.
+    fn invoke_bulk(&self, offer: &BulkOffer) {
+        match &offer.confirmation {
+            Some(confirmation) => {
+                let window = self.clone();
+                let offer = offer.clone();
+                self.confirm(confirmation, move || window.dispatch_bulk(&offer));
+            }
+            None => self.dispatch_bulk(offer),
+        }
+    }
+
+    /// Send the whole selection as one request, so the outcome is reported once rather
+    /// than as a stack of toasts.
+    fn dispatch_bulk(&self, offer: &BulkOffer) {
+        let requests: Vec<ActionRequest> = offer
+            .targets
+            .iter()
+            .map(|target| ActionRequest {
+                action: target.action,
+                id: target.id.clone(),
+                label: target.label.clone(),
+            })
+            .collect();
+
+        if requests.is_empty() {
+            return;
+        }
+
+        self.send(Command::ActMany(requests));
+        // The ticks refer to objects that are about to change state or vanish.
+        self.clear_checks();
+    }
+
     /// Bind the tab bar to the view and make the metadata page permanent.
     fn setup_tabs(&self) {
         let view = self.imp().tab_view.clone();
@@ -655,8 +844,10 @@ impl LaveWindow {
         // standing in for an image, would otherwise outlive the tab that wanted it.
         match key.kind {
             TabKind::Logs => {
-                self.imp().log_buffers.borrow_mut().remove(&key.object_id);
-                self.send(Command::StopLogs);
+                self.imp().log_views.borrow_mut().remove(&key.object_id);
+                self.send(Command::StopLogs {
+                    container_id: key.object_id.clone(),
+                });
             }
             TabKind::Files => {
                 self.imp().browser.replace(None);
@@ -893,61 +1084,194 @@ impl LaveWindow {
         store.splice(0, store.n_items(), &objects);
     }
 
-    /// Open a log tab for a container and start the stream.
+    /// Open a log tab for a container and start following it.
+    ///
+    /// The tail is the default view: a container that has been running for a week has
+    /// more output than anyone wants delivered before the tab appears, and what is
+    /// interesting is almost always the end of it.
     fn open_logs(&self, container_id: &str, title: &str) {
-        let buffer = gtk::TextBuffer::new(None);
-        for tag in log_tags() {
-            buffer.tag_table().add(&tag);
-        }
-        self.imp()
-            .log_buffers
-            .borrow_mut()
-            .insert(container_id.to_owned(), buffer.clone());
-
         let key = TabKey {
             kind: TabKind::Logs,
             object_id: container_id.to_owned(),
         };
-        let node = NodeId::Container(container_id.to_owned());
-        let opened = self.open_tab(key, &node, &format!("{title} \u{2014} Logs"), || {
-            let view = gtk::TextView::builder()
-                .buffer(&buffer)
-                .editable(false)
-                .cursor_visible(false)
-                .monospace(true)
-                .wrap_mode(gtk::WrapMode::WordChar)
-                .top_margin(12)
-                .bottom_margin(12)
-                .left_margin(12)
-                .right_margin(12)
-                .build();
 
-            gtk::ScrolledWindow::builder()
-                .child(&view)
-                .vexpand(true)
-                .build()
-                .upcast()
-        });
-
-        // Already open: the tab was focused rather than rebuilt, and its stream is
-        // still running, so asking for it again would restart it for nothing.
-        if opened.is_none() {
+        // Already open: focus it. Rebuilding would leave the visible tab attached to a
+        // buffer nothing writes to any more.
+        if let Some(existing) = self.imp().open_tabs.borrow().get(&key) {
+            self.imp().tab_view.set_selected_page(existing);
             return;
         }
+
+        let buffer = gtk::TextBuffer::new(None);
+        for tag in log_tags() {
+            buffer.tag_table().add(&tag);
+        }
+
+        let view = gtk::TextView::builder()
+            .buffer(&buffer)
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(12)
+            .bottom_margin(12)
+            .left_margin(12)
+            .right_margin(12)
+            .build();
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&view)
+            .vexpand(true)
+            .build();
+
+        // A permanent mark at the end of the buffer, with right gravity so lines are
+        // inserted before it rather than after.
+        //
+        // The viewer scrolls to this mark rather than driving the scrollbar itself. A
+        // text view lays its lines out lazily, so at the moment a line is inserted there
+        // is no position to scroll to yet; `scroll_to_mark` is the one call that knows to
+        // finish the job once there is. Setting the adjustment instead lands short of the
+        // end and is undone again by the view's own scrolling a moment later.
+        buffer.create_mark(Some(END_MARK), &buffer.end_iter(), false);
+
+        let following = std::rc::Rc::new(std::cell::Cell::new(true));
+
+        // Whether the viewer is still following is taken from what the user does, not
+        // from where the view has ended up: while output is arriving the view is
+        // somewhere between the two more or less constantly.
+        let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        let interrupt = std::rc::Rc::clone(&following);
+        controller.connect_scroll(move |_, _, delta| {
+            if delta < 0.0 {
+                interrupt.set(false);
+            }
+            glib::Propagation::Proceed
+        });
+        scroller.add_controller(controller);
+
+        // Paging up with the keyboard says the same thing as scrolling up with a wheel.
+        let keys = gtk::EventControllerKey::new();
+        let interrupt = std::rc::Rc::clone(&following);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if matches!(
+                key,
+                gtk::gdk::Key::Page_Up | gtk::gdk::Key::Up | gtk::gdk::Key::Home
+            ) {
+                interrupt.set(false);
+            }
+            glib::Propagation::Proceed
+        });
+        view.add_controller(keys);
+
+        // Arriving back at the bottom, by whatever means, resumes it.
+        let resume = std::rc::Rc::clone(&following);
+        scroller.connect_edge_reached(move |_, edge| {
+            if edge == gtk::PositionType::Bottom {
+                resume.set(true);
+            }
+        });
+
+        self.imp().log_views.borrow_mut().insert(
+            container_id.to_owned(),
+            LogView {
+                buffer,
+                view: view.clone(),
+                scroller: scroller.clone(),
+                following,
+            },
+        );
+
+        let node = NodeId::Container(container_id.to_owned());
+        let owned_id = container_id.to_owned();
+        self.open_tab(key, &node, &format!("{title} \u{2014} Logs"), || {
+            let layout = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            layout.append(&self.log_range_toggle(&owned_id));
+            layout.append(&scroller);
+            layout.upcast()
+        });
 
         self.send(Command::Logs {
             container_id: container_id.to_owned(),
             follow: true,
+            tail: Some(TAIL_LINES),
+        });
+    }
+
+    /// The tail / whole-log switch, in the manner of the table's own filter.
+    fn log_range_toggle(&self, container_id: &str) -> gtk::Box {
+        let tail = gtk::ToggleButton::builder()
+            .label("Tail")
+            .tooltip_text(format!("Follow the last {TAIL_LINES} lines as they arrive"))
+            .active(true)
+            .build();
+        let whole = gtk::ToggleButton::builder()
+            .label("Whole Log")
+            .tooltip_text("Load everything the container has written, and keep following")
+            .group(&tail)
+            .build();
+
+        // Only the button becoming active reports, so the pair produces one change.
+        for (button, whole_log) in [(&tail, false), (&whole, true)] {
+            let window = self.clone();
+            let container_id = container_id.to_owned();
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    window.set_log_range(&container_id, whole_log);
+                }
+            });
+        }
+
+        let buttons = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .build();
+        buttons.add_css_class("linked");
+        buttons.append(&tail);
+        buttons.append(&whole);
+
+        let holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .halign(gtk::Align::End)
+            .margin_top(6)
+            .margin_end(12)
+            .build();
+        holder.append(&buttons);
+        holder
+    }
+
+    /// Switch a log tab between the tail and the whole log.
+    ///
+    /// The stream is restarted rather than extended: the daemon has no way to send the
+    /// earlier lines of a stream already in progress, so the buffer is cleared and
+    /// refilled. The runtime replaces this container's stream and leaves every other
+    /// tab's alone.
+    fn set_log_range(&self, container_id: &str, whole: bool) {
+        let view = self.imp().log_views.borrow().get(container_id).cloned();
+        let Some(view) = view else {
+            return;
+        };
+        view.buffer.set_text("");
+        // Refilling starts at the end again, whatever the user was reading before.
+        view.following.set(true);
+
+        self.send(Command::Logs {
+            container_id: container_id.to_owned(),
+            follow: true,
+            tail: if whole { None } else { Some(TAIL_LINES) },
         });
     }
 
     /// Append streamed lines, trimming as many from the top as the transcript dropped.
     pub fn apply_log_lines(&self, container_id: &str, lines: &[LogLine], dropped: usize) {
-        let borrowed = self.imp().log_buffers.borrow();
-        let Some(buffer) = borrowed.get(container_id) else {
+        // Cloned out and the borrow released: inserting into a text buffer runs GTK code
+        // that must not find this map already borrowed.
+        let view = self.imp().log_views.borrow().get(container_id).cloned();
+        let Some(view) = view else {
             // The tab closed while these were in flight.
             return;
         };
+        let buffer = &view.buffer;
 
         for _ in 0..dropped {
             let mut start = buffer.start_iter();
@@ -977,14 +1301,26 @@ impl LaveWindow {
                 buffer.apply_tag_by_name(token_tag(span.token), &start, &stop);
             }
         }
+
+        // Re-issued for every batch, so a view that something else has scrolled — the
+        // text view's own housekeeping does, now and then — is brought back to the end
+        // rather than left stranded there.
+        if view.following.get() {
+            scroll_to_end(&view.view, buffer);
+        }
     }
 
-    /// Say why the stream stopped, but only when something went wrong: a container that
+    /// Say why a stream stopped, but only when something went wrong: a container that
     /// simply finished writing needs no announcement.
-    pub fn apply_logs_ended(&self, error: Option<&str>) {
-        if let Some(error) = error {
-            self.apply_action_outcome(&format!("The log stream ended: {error}"), true);
-        }
+    pub fn apply_logs_ended(&self, container_id: &str, error: Option<&str>) {
+        let Some(error) = error else {
+            return;
+        };
+
+        let label = self
+            .action_target(&NodeId::Container(container_id.to_owned()))
+            .1;
+        self.apply_action_outcome(&format!("The log stream for {label} ended: {error}"), true);
     }
 
     /// Show a reconstructed Dockerfile in a tab.
@@ -1081,7 +1417,13 @@ impl LaveWindow {
             return;
         };
 
-        self.imp().selected.replace(Some(id));
+        // A refresh re-selects the same object, which notifies because the row's item is
+        // new; only a genuine change of page discards the ticks.
+        let previous = self.imp().selected.replace(Some(id.clone()));
+        if previous.as_ref() != Some(&id) {
+            self.clear_checks();
+        }
+
         self.render_detail();
     }
 
@@ -1119,13 +1461,18 @@ impl LaveWindow {
             .window_title
             .set_subtitle(page.subtitle.as_deref().unwrap_or_default());
 
-        let handlers = self.handlers();
-        let sort = self.sort_order();
+        // The cog belongs to the widgets about to be replaced; the window keeps whatever
+        // the new render hands it.
+        self.imp().cog.replace(None);
+
+        let table_id = page.table.as_ref().map_or("", |table| table.id);
+        let handlers = self.handlers(table_id);
+        let state = self.table_state(page.table.as_ref());
         detail_pane::render(
             &self.imp().lead_box,
             &self.imp().detail_box,
             &page,
-            &sort,
+            &state,
             &handlers,
         );
         self.position_divider(page.table_filter.as_ref());
@@ -1154,8 +1501,11 @@ impl LaveWindow {
     }
 
     /// The callbacks the detail pane needs. Rebuilt per render, since the widgets it
-    /// attaches them to are rebuilt too.
-    fn handlers(&self) -> detail_pane::Handlers {
+    /// attaches them to are rebuilt too, and scoped to the table on the page: the sort
+    /// and the column widths are stored against it by name.
+    fn handlers(&self, table: &str) -> detail_pane::Handlers {
+        let table = table.to_owned();
+
         detail_pane::Handlers {
             navigate: {
                 let window = self.clone();
@@ -1165,15 +1515,41 @@ impl LaveWindow {
                 let window = self.clone();
                 Rc::new(move |show| window.set_show_stopped(show))
             },
-            sort_changed: {
+            cog_ready: {
                 let window = self.clone();
-                Rc::new(move |order| window.set_sort_order(&order))
+                Rc::new(move |cog| window.adopt_cog(&cog))
             },
-            context: {
-                let window = self.clone();
-                Rc::new(move |node, widget, x, y| {
-                    window.show_context_menu(&node, &widget, x, y);
-                })
+            table: TableHandlers {
+                activate: {
+                    let window = self.clone();
+                    Rc::new(move |target| window.navigate_to(&target))
+                },
+                sort_changed: {
+                    let window = self.clone();
+                    let table = table.clone();
+                    Rc::new(move |order| window.set_sort_order(&table, order))
+                },
+                context: {
+                    let window = self.clone();
+                    Rc::new(move |node, widget, x, y| {
+                        window.show_context_menu(&node, &widget, x, y);
+                    })
+                },
+                checked: {
+                    let window = self.clone();
+                    Rc::new(move |node: &NodeId| {
+                        window.imp().checked.borrow().contains(&node.key())
+                    })
+                },
+                toggle: {
+                    let window = self.clone();
+                    Rc::new(move |node, on| window.set_checked(&node, on))
+                },
+                resized: {
+                    let window = self.clone();
+                    let table = table.clone();
+                    Rc::new(move |column, width| window.set_column_width(&table, &column, width))
+                },
             },
         }
     }
@@ -1185,14 +1561,19 @@ impl LaveWindow {
     /// move the panel away from whatever is being looked at.
     fn invoke(&self, node: &NodeId, offer: &Offer) {
         match &offer.confirmation {
-            Some(confirmation) => self.confirm_then_act(node, offer, confirmation),
+            Some(confirmation) => {
+                let window = self.clone();
+                let offer = offer.clone();
+                let node = node.clone();
+                self.confirm(confirmation, move || window.dispatch(&node, &offer));
+            }
             None => self.dispatch(node, offer),
         }
     }
 
     /// Ask before anything irreversible. Cancel is the default response, so a stray
     /// Return key cannot destroy anything.
-    fn confirm_then_act(&self, node: &NodeId, offer: &Offer, confirmation: &Confirmation) {
+    fn confirm(&self, confirmation: &Confirmation, on_confirm: impl Fn() + 'static) {
         let dialog = adw::AlertDialog::new(Some(&confirmation.heading), Some(&confirmation.body));
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("confirm", &confirmation.confirm_label);
@@ -1205,12 +1586,9 @@ impl LaveWindow {
             dialog.set_extra_child(Some(&confirmation_list(&confirmation.items)));
         }
 
-        let window = self.clone();
-        let offer = offer.clone();
-        let node = node.clone();
         dialog.connect_response(None, move |_, response| {
             if response == "confirm" {
-                window.dispatch(&node, &offer);
+                on_confirm();
             }
         });
 
@@ -1280,12 +1658,34 @@ impl LaveWindow {
         }
     }
 
-    fn sort_order(&self) -> SortOrder {
-        let settings = self.imp().settings.borrow();
-        SortOrder {
-            column: settings.container_sort_column.clone(),
-            descending: settings.container_sort_descending,
-        }
+    /// How a table should open: the order the user set this session, or the table's own
+    /// default, together with the widths they have dragged its columns to.
+    fn table_state(&self, table: Option<&Table>) -> detail_pane::TableState {
+        let Some(table) = table else {
+            return detail_pane::TableState {
+                sort: SortOrder::default(),
+                widths: BTreeMap::new(),
+            };
+        };
+
+        let sort = self
+            .imp()
+            .sorts
+            .borrow()
+            .get(table.id)
+            .cloned()
+            .unwrap_or_else(|| SortOrder::from_default(table));
+
+        let widths = self
+            .imp()
+            .settings
+            .borrow()
+            .column_widths
+            .get(table.id)
+            .cloned()
+            .unwrap_or_default();
+
+        detail_pane::TableState { sort, widths }
     }
 
     /// Toggle between running-only and everything, and remember the choice.
@@ -1301,24 +1701,32 @@ impl LaveWindow {
         self.render_detail();
     }
 
-    /// Remember a re-sort. The pane is not re-rendered: the view has already applied it,
-    /// and rebuilding would discard the selection for no visible gain.
-    fn set_sort_order(&self, order: &SortOrder) {
-        {
-            let mut settings = self.imp().settings.borrow_mut();
-            if settings.container_sort_column == order.column
-                && settings.container_sort_descending == order.descending
-            {
-                return;
-            }
-            settings.container_sort_column.clone_from(&order.column);
-            settings.container_sort_descending = order.descending;
+    /// Remember a re-sort for the rest of the session, so a refresh does not undo it.
+    /// The pane is not re-rendered: the view has already applied it, and rebuilding would
+    /// discard the selection for no visible gain.
+    fn set_sort_order(&self, table: &str, order: SortOrder) {
+        self.imp()
+            .sorts
+            .borrow_mut()
+            .insert(table.to_owned(), order);
+    }
+
+    /// Remember a column the user dragged. Restoring a width notifies too, which is why
+    /// the model reports whether anything actually changed.
+    fn set_column_width(&self, table: &str, column: &str, width: i32) {
+        let changed = self
+            .imp()
+            .settings
+            .borrow_mut()
+            .set_column_width(table, column, width);
+
+        if changed {
+            self.store_settings();
         }
-        self.store_settings();
     }
 
     fn store_settings(&self) {
-        settings::save(&SystemEnv, &self.imp().settings.borrow());
+        self.imp().prefs.store(&self.imp().settings.borrow());
     }
 
     /// Follow a link from the detail pane: select the target in the sidebar, which
@@ -1536,6 +1944,112 @@ fn build_factory() -> gtk::SignalListItemFactory {
     factory
 }
 
+/// One line of a menu, in the terms the widget layer needs: what the core decided,
+/// flattened so the same builder serves the row menu and the cog.
+#[derive(Debug, Clone)]
+pub struct MenuEntry {
+    pub label: String,
+    pub icon: &'static str,
+    pub tone: Tone,
+    pub destructive: bool,
+}
+
+impl MenuEntry {
+    fn from_offer(offer: &Offer) -> Self {
+        Self {
+            label: offer.label.clone(),
+            icon: offer.icon,
+            tone: offer.tone(),
+            destructive: offer.is_destructive(),
+        }
+    }
+
+    fn from_bulk(offer: &BulkOffer) -> Self {
+        Self {
+            label: offer.label.clone(),
+            icon: offer.icon,
+            tone: offer.tone(),
+            destructive: offer.is_destructive(),
+        }
+    }
+}
+
+/// A menu whose items refer to their offers by position.
+///
+/// Position rather than name because the set of actions depends on the state of what
+/// was clicked, so there is no fixed list of action names to register.
+fn build_menu(entries: &[MenuEntry], action: &str) -> gtk::gio::Menu {
+    let menu = gtk::gio::Menu::new();
+    let mut section = gtk::gio::Menu::new();
+    let mut previous_destructive = false;
+
+    for (index, entry) in entries.iter().enumerate() {
+        // Destructive actions get their own section, so the separator sits between
+        // "Restart" and "Remove" rather than anywhere arbitrary.
+        if entry.destructive && !previous_destructive && section.n_items() > 0 {
+            menu.append_section(None, &section);
+            section = gtk::gio::Menu::new();
+        }
+        previous_destructive = entry.destructive;
+
+        let index = i32::try_from(index).unwrap_or(0);
+        let item = gtk::gio::MenuItem::new(Some(&entry.label), Some(&format!("{action}({index})")));
+        item.set_icon(&gtk::gio::ThemedIcon::new(entry.icon));
+        section.append_item(&item);
+    }
+
+    menu.append_section(None, &section);
+    menu
+}
+
+/// Tint the icons of the items that remove or halt something.
+///
+/// `GtkPopoverMenu` builds its own widgets from the model, so there is nothing to style
+/// until it has done so: this walks what it built. The buttons come out in the order the
+/// items were appended, and the count is checked before anything is coloured — a GTK
+/// that laid the menu out differently would leave it plain rather than paint the wrong
+/// row red.
+fn tint_menu(popover: &gtk::Widget, entries: &[MenuEntry]) {
+    let mut buttons = Vec::new();
+    collect_model_buttons(popover, &mut buttons);
+
+    if buttons.len() != entries.len() {
+        tracing::debug!(
+            "menu has {} items but {} buttons; leaving it untinted",
+            entries.len(),
+            buttons.len()
+        );
+        return;
+    }
+
+    for (button, entry) in buttons.iter().zip(entries) {
+        if entry.tone != Tone::Bad {
+            continue;
+        }
+        let mut child = button.first_child();
+        while let Some(node) = child {
+            if let Ok(image) = node.clone().downcast::<gtk::Image>() {
+                image.add_css_class(entry.tone.css_class());
+            }
+            child = node.next_sibling();
+        }
+    }
+}
+
+/// `GtkModelButton` is private to GTK, so it is recognised by name.
+fn collect_model_buttons(widget: &gtk::Widget, found: &mut Vec<gtk::Widget>) {
+    if widget.type_().name() == "GtkModelButton" {
+        found.push(widget.clone());
+        return;
+    }
+
+    let mut child = widget.first_child();
+    while let Some(node) = child {
+        collect_model_buttons(&node, found);
+        child = node.next_sibling();
+    }
+}
+
 /// The named objects a destructive confirmation will remove.
 fn confirmation_list(items: &[String]) -> gtk::ScrolledWindow {
     let list = gtk::Box::builder()
@@ -1559,6 +2073,37 @@ fn confirmation_list(items: &[String]) -> gtk::ScrolledWindow {
         .propagate_natural_height(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build()
+}
+
+/// An open log tab. Cloned out of the map before the buffer is touched, so nothing holds
+/// a borrow across a call into GTK.
+#[derive(Clone)]
+pub struct LogView {
+    pub buffer: gtk::TextBuffer,
+    pub view: gtk::TextView,
+    pub scroller: gtk::ScrolledWindow,
+    /// Whether the view is following the end of the log.
+    ///
+    /// Held rather than worked out per batch: a scroll is not applied until the new text
+    /// has been laid out, so a view that has just been told to scroll still *reads* as
+    /// being partway up. Deciding from that reading, the viewer would give up following
+    /// the moment output arrived faster than it could lay out — which is exactly when
+    /// following matters.
+    pub following: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+/// The mark the viewer scrolls to. Permanent, and with right gravity, so it stays at the
+/// end as lines arrive; a mark created and deleted per batch would be gone before the
+/// view had laid out the lines it was meant to scroll past.
+const END_MARK: &str = "end";
+
+/// Scroll so the last line is at the bottom of the view. Deferred by GTK until the lines
+/// in between have been laid out, which is the point of scrolling to a mark.
+fn scroll_to_end(view: &gtk::TextView, buffer: &gtk::TextBuffer) {
+    let Some(mark) = buffer.mark(END_MARK) else {
+        return;
+    };
+    view.scroll_to_mark(&mark, 0.0, true, 0.0, 1.0);
 }
 
 /// The tag marking stderr in the log viewer.

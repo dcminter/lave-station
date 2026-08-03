@@ -3,6 +3,7 @@
 //! No decisions here — the columns, their order and their sort keys all come from
 //! `lave_core::model::table`.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use gtk::glib;
@@ -95,7 +96,8 @@ impl TableRowObject {
     }
 }
 
-/// How a table is sorted, in terms the settings file can hold.
+/// How a table is sorted. Held for the session only: the user's own order is deliberately
+/// not written to the settings store, so every launch opens on the table's own default.
 #[derive(Debug, Clone, Default)]
 pub struct SortOrder {
     /// Column title. A title no longer present is ignored, leaving the table unsorted.
@@ -103,19 +105,44 @@ pub struct SortOrder {
     pub descending: bool,
 }
 
+impl SortOrder {
+    /// The order a table opens in, before the user has said otherwise.
+    #[must_use]
+    pub fn from_default(table: &Table) -> Self {
+        table.default_sort.map_or_else(Self::default, |sort| Self {
+            column: sort.column.to_owned(),
+            descending: sort.descending,
+        })
+    }
+}
+
+/// What the window has to tell a table, beyond the rows themselves.
+pub struct TableHandlers {
+    /// A row was chosen, which is how the tables navigate to an object.
+    pub activate: Rc<dyn Fn(NodeId)>,
+    /// The user re-sorted. Does not fire for the initial sort applied here.
+    pub sort_changed: Rc<dyn Fn(SortOrder)>,
+    /// A secondary click, carrying the cell that was hit so a menu can be anchored.
+    pub context: Rc<dyn Fn(NodeId, gtk::Widget, f64, f64)>,
+    /// Whether a row is checked for the next bulk action.
+    pub checked: Rc<dyn Fn(&NodeId) -> bool>,
+    /// A row's checkbox was operated.
+    pub toggle: Rc<dyn Fn(NodeId, bool)>,
+    /// A column was dragged to a new width, by title.
+    pub resized: Rc<dyn Fn(String, i32)>,
+}
+
 /// Build the table.
 ///
-/// `on_activate` fires when a row is chosen, which is how the tables navigate to an
-/// object. `on_sort_changed` reports the user re-sorting, so the choice can be stored;
-/// it does not fire for the initial sort applied here. `on_context` fires on a
-/// secondary click, carrying the cell that was hit so a menu can be anchored to it.
+/// `sort` is already resolved by the caller — the session's order if the user has set
+/// one, the table's own default otherwise. `widths` are the widths the user has dragged
+/// columns to, by title; a column with none sizes itself.
 #[must_use]
 pub fn build(
     table: &Table,
     sort: &SortOrder,
-    on_activate: Rc<dyn Fn(NodeId)>,
-    on_sort_changed: Rc<dyn Fn(SortOrder)>,
-    on_context: &Rc<dyn Fn(NodeId, gtk::Widget, f64, f64)>,
+    widths: &BTreeMap<String, i32>,
+    handlers: &TableHandlers,
 ) -> gtk::ColumnView {
     let store = gtk::gio::ListStore::new::<TableRowObject>();
     let objects: Vec<TableRowObject> = table
@@ -139,13 +166,32 @@ pub fn build(
     selection.set_can_unselect(true);
     view.set_model(Some(&selection));
 
+    // Leading, so the checkboxes line up down the left edge whatever the table.
+    view.append_column(&build_check_column(handlers));
+
     for (index, column) in table.columns.iter().enumerate() {
-        view.append_column(&build_column(index, column, on_context));
+        let built = build_column(index, column, &handlers.context);
+
+        // Restoring a width makes GTK notify, which reports the width we just set; the
+        // settings model treats storing an unchanged width as no change, so the store is
+        // not rewritten on every render.
+        if let Some(width) = widths.get(&column.title) {
+            built.set_fixed_width(*width);
+        }
+
+        let resized = Rc::clone(&handlers.resized);
+        let title = column.title.clone();
+        built.connect_fixed_width_notify(move |column| {
+            resized(title.clone(), column.fixed_width());
+        });
+
+        view.append_column(&built);
     }
 
     apply_sort(&view, sort);
-    watch_sort(&view, on_sort_changed);
+    watch_sort(&view, Rc::clone(&handlers.sort_changed));
 
+    let on_activate = Rc::clone(&handlers.activate);
     view.connect_activate(move |view, position| {
         let Some(model) = view.model() else {
             return;
@@ -161,6 +207,76 @@ pub fn build(
     });
 
     view
+}
+
+/// The leading column of checkboxes, which is what makes a bulk action possible.
+///
+/// The checked set lives in the window rather than in the widgets: the pane is rebuilt
+/// whenever a refresh arrives, and ticks that vanished on every daemon event would be
+/// unusable.
+fn build_check_column(handlers: &TableHandlers) -> gtk::ColumnViewColumn {
+    let factory = gtk::SignalListItemFactory::new();
+
+    let toggle = Rc::clone(&handlers.toggle);
+    factory.connect_setup(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+
+        let check = gtk::CheckButton::builder()
+            .halign(gtk::Align::Center)
+            .tooltip_text("Include this row in the next bulk action")
+            .build();
+
+        // Connected once, and reads the row it is bound to at the time it fires: the
+        // list item's row is replaced before `bind` runs, so this always addresses what
+        // is on screen. Weak, because the list item owns this widget.
+        let toggle = Rc::clone(&toggle);
+        let owner = item.clone();
+        check.connect_toggled(glib::clone!(
+            #[weak]
+            owner,
+            move |check| {
+                if let Some(node) = owner
+                    .item()
+                    .and_downcast::<TableRowObject>()
+                    .and_then(|row| row.key())
+                {
+                    toggle(node, check.is_active());
+                }
+            }
+        ));
+
+        item.set_child(Some(&check));
+    });
+
+    let checked = Rc::clone(&handlers.checked);
+    factory.connect_bind(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(check) = item.child().and_downcast::<gtk::CheckButton>() else {
+            return;
+        };
+        let Some(node) = item
+            .item()
+            .and_downcast::<TableRowObject>()
+            .and_then(|row| row.key())
+        else {
+            return;
+        };
+
+        // Setting this fires `toggled`, which writes back the value just read. Toggling
+        // is idempotent, so the round trip changes nothing.
+        check.set_active(checked(&node));
+    });
+
+    gtk::ColumnViewColumn::builder()
+        .title("")
+        .factory(&factory)
+        .resizable(false)
+        .expand(false)
+        .build()
 }
 
 /// Drop the gestures `bind` attached, so a recycled cell starts clean.

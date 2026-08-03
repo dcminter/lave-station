@@ -1,15 +1,14 @@
-//! Window preferences that outlive a run.
+//! View preferences that outlive a run.
 //!
-//! A plain file under `$XDG_CONFIG_HOME` rather than `GSettings`, which would need a
-//! compiled schema installed system-wide before the application would start at all.
-//! Reading is total: a corrupt or partial file yields defaults rather than an error,
-//! because a lost sidebar width is not worth refusing to open the window over.
+//! Only the *shape* of them lives here: the values, their permitted ranges, and the
+//! clamping that keeps a hand-edited store from wedging the window. Where they are
+//! actually kept is the widget layer's business — see `lave::prefs`, which binds these
+//! to `GSettings`.
+//!
+//! Reading is total: a missing or nonsensical value yields a default rather than an
+//! error, because a lost sidebar width is not worth refusing to open the window over.
 
-use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
-
-use crate::endpoint::EnvSource;
+use std::collections::BTreeMap;
 
 /// Wide enough for a tag like `mcr.microsoft.com/playwright:v1.49.0-noble`.
 pub const DEFAULT_SIDEBAR_WIDTH: i32 = 300;
@@ -17,23 +16,25 @@ pub const DEFAULT_SIDEBAR_WIDTH: i32 = 300;
 pub const MIN_SIDEBAR_WIDTH: i32 = 180;
 pub const MAX_SIDEBAR_WIDTH: i32 = 900;
 
-/// Newest first, as `docker ps` itself lists them.
-pub const DEFAULT_SORT_COLUMN: &str = "Created";
+/// Narrow enough to hide a column's contents, wide enough to still be grabbable.
+pub const MIN_COLUMN_WIDTH: i32 = 32;
+/// Beyond this the column is wider than any window it could be dragged in.
+pub const MAX_COLUMN_WIDTH: i32 = 2000;
 
-const DIRECTORY: &str = "lave-station";
-const FILE: &str = "settings.json";
+/// Widths the user dragged columns to, by table and then by column title.
+pub type ColumnWidths = BTreeMap<String, BTreeMap<String, i32>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub sidebar_width: i32,
     /// Whether the environment page's container table includes stopped containers.
     pub show_stopped_containers: bool,
-    /// Column title the container table is sorted by. A title that no longer exists is
-    /// ignored at render time rather than rejected here, so renaming a column cannot
-    /// make a stored file invalid.
-    pub container_sort_column: String,
-    pub container_sort_descending: bool,
+    /// Column widths, keyed by table id and column title. A table or column that no
+    /// longer exists is ignored at render time rather than dropped here, so renaming a
+    /// column cannot make a stored value invalid.
+    ///
+    /// Sort order is deliberately absent: it lasts for the session only.
+    pub column_widths: ColumnWidths,
 }
 
 impl Default for Settings {
@@ -43,88 +44,73 @@ impl Default for Settings {
             // The rest of the application shows stopped containers, so this does too
             // until the user says otherwise.
             show_stopped_containers: true,
-            container_sort_column: DEFAULT_SORT_COLUMN.to_owned(),
-            container_sort_descending: true,
+            column_widths: ColumnWidths::new(),
         }
     }
 }
 
 impl Settings {
     /// Bring every field within its permitted range. Applied on the way in and on the
-    /// way out, so neither a hand-edited file nor an odd window state can wedge the
+    /// way out, so neither a hand-edited store nor an odd window state can wedge the
     /// sidebar at an unusable width.
     #[must_use]
     pub fn clamped(self) -> Self {
+        let column_widths = self
+            .column_widths
+            .into_iter()
+            .map(|(table, columns)| {
+                let columns = columns
+                    .into_iter()
+                    .map(|(column, width)| (column, clamp_column(width)))
+                    .collect();
+                (table, columns)
+            })
+            .collect();
+
         Self {
             sidebar_width: self
                 .sidebar_width
                 .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH),
+            column_widths,
             ..self
         }
     }
-}
 
-/// Where the settings file lives: `$XDG_CONFIG_HOME/lave-station/settings.json`,
-/// falling back to `$HOME/.config` as the XDG base directory specification requires.
-#[must_use]
-pub fn path(env: &dyn EnvSource) -> Option<PathBuf> {
-    let base = env
-        .var("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env.var("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".config"))
-        })?;
-
-    Some(base.join(DIRECTORY).join(FILE))
-}
-
-/// Parse stored settings, falling back to defaults for anything missing or malformed.
-#[must_use]
-pub fn parse(text: &str) -> Settings {
-    serde_json::from_str::<Settings>(text)
-        .unwrap_or_default()
-        .clamped()
-}
-
-/// Render settings for storage.
-#[must_use]
-pub fn serialize(settings: &Settings) -> String {
-    serde_json::to_string_pretty(settings).unwrap_or_else(|_| String::new())
-}
-
-/// Read the settings file, or return defaults when there is not one to read.
-#[must_use]
-pub fn load(env: &dyn EnvSource) -> Settings {
-    path(env)
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .map_or_else(Settings::default, |text| parse(&text))
-}
-
-/// Write the settings file, creating its directory. Failure is logged, not propagated:
-/// nothing the application does depends on the write succeeding.
-pub fn save(env: &dyn EnvSource, settings: &Settings) {
-    let Some(path) = path(env) else {
-        tracing::debug!("no config directory: settings not saved");
-        return;
-    };
-
-    if let Some(parent) = path.parent()
-        && let Err(error) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!("could not create {}: {error}", parent.display());
-        return;
+    /// The width to open a column at, or `None` for whatever the view works out itself.
+    #[must_use]
+    pub fn column_width(&self, table: &str, column: &str) -> Option<i32> {
+        self.column_widths
+            .get(table)
+            .and_then(|columns| columns.get(column))
+            .copied()
     }
 
-    write(&path, &serialize(&settings.clone().clamped()));
+    /// Remember a column's width. Returns whether anything actually changed, so a caller
+    /// can skip writing the store when a restored width is merely being echoed back.
+    ///
+    /// A negative width is GTK saying "size this yourself", which is the absence of a
+    /// stored width rather than a width of its own.
+    pub fn set_column_width(&mut self, table: &str, column: &str, width: i32) -> bool {
+        if width < 0 {
+            return self
+                .column_widths
+                .get_mut(table)
+                .is_some_and(|columns| columns.remove(column).is_some());
+        }
+
+        let width = clamp_column(width);
+        let columns = self.column_widths.entry(table.to_owned()).or_default();
+
+        if columns.get(column) == Some(&width) {
+            return false;
+        }
+        columns.insert(column.to_owned(), width);
+        true
+    }
 }
 
-fn write(path: &Path, contents: &str) {
-    if let Err(error) = std::fs::write(path, contents) {
-        tracing::warn!("could not write {}: {error}", path.display());
-    }
+fn clamp_column(width: i32) -> i32 {
+    width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
 }
 
 #[cfg(test)]
@@ -133,184 +119,124 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
-    use std::collections::BTreeMap;
-
-    struct FakeEnv(BTreeMap<String, String>);
-
-    impl FakeEnv {
-        fn new(pairs: &[(&str, &str)]) -> Self {
-            Self(
-                pairs
-                    .iter()
-                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                    .collect(),
-            )
-        }
-    }
-
-    impl EnvSource for FakeEnv {
-        fn var(&self, key: &str) -> Option<String> {
-            self.0.get(key).cloned()
-        }
-    }
 
     #[test]
-    fn the_file_lives_under_the_xdg_config_directory() {
-        let env = FakeEnv::new(&[("XDG_CONFIG_HOME", "/home/dave/.config")]);
-
-        assert_eq!(
-            path(&env),
-            Some(PathBuf::from(
-                "/home/dave/.config/lave-station/settings.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn without_xdg_config_home_the_specified_fallback_is_used() {
-        let env = FakeEnv::new(&[("HOME", "/home/dave")]);
-
-        assert_eq!(
-            path(&env),
-            Some(PathBuf::from(
-                "/home/dave/.config/lave-station/settings.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn an_empty_xdg_variable_is_treated_as_unset_rather_than_as_the_root() {
-        let env = FakeEnv::new(&[("XDG_CONFIG_HOME", ""), ("HOME", "/home/dave")]);
-
-        assert_eq!(
-            path(&env),
-            Some(PathBuf::from(
-                "/home/dave/.config/lave-station/settings.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn with_no_home_at_all_there_is_nowhere_to_store_settings() {
-        assert_eq!(path(&FakeEnv::new(&[])), None);
-    }
-
-    #[test]
-    fn settings_round_trip_through_their_stored_form() {
-        let settings = Settings {
-            sidebar_width: 420,
-            show_stopped_containers: false,
-            container_sort_column: "Status".to_owned(),
-            container_sort_descending: false,
-        };
-
-        assert_eq!(parse(&serialize(&settings)), settings);
-    }
-
-    #[test]
-    fn the_container_table_defaults_to_newest_first_showing_everything() {
+    fn the_defaults_show_everything_at_a_readable_width() {
         let settings = Settings::default();
 
-        assert_eq!(settings.container_sort_column, "Created");
-        assert!(settings.container_sort_descending);
+        assert_eq!(settings.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
         assert!(settings.show_stopped_containers);
-    }
-
-    #[test]
-    fn a_stored_file_from_before_these_options_existed_still_loads() {
-        // Version 2.0 wrote only the width; it must not read back as a broken file.
-        let settings = parse("{\"sidebar_width\": 420}");
-
-        assert_eq!(settings.sidebar_width, 420);
-        assert_eq!(settings.container_sort_column, DEFAULT_SORT_COLUMN);
-        assert!(settings.show_stopped_containers);
-    }
-
-    #[test]
-    fn a_sort_column_that_no_longer_exists_is_preserved_rather_than_discarded() {
-        // Whether it is usable is decided where the table is rendered; storage keeps
-        // whatever it was given, so a downgrade does not lose the user's choice.
-        assert_eq!(
-            parse("{\"container_sort_column\": \"Nonexistent\"}").container_sort_column,
-            "Nonexistent"
-        );
-    }
-
-    #[test]
-    fn a_missing_field_falls_back_to_its_default_rather_than_failing() {
-        assert_eq!(parse("{}"), Settings::default());
-    }
-
-    #[test]
-    fn a_corrupt_file_yields_defaults_rather_than_an_error() {
-        for text in ["", "not json", "[1, 2, 3]", "{\"sidebar_width\": \"wide\"}"] {
-            assert_eq!(parse(text), Settings::default(), "text was {text:?}");
-        }
+        assert!(settings.column_widths.is_empty());
     }
 
     #[test]
     fn an_unreasonable_stored_width_is_brought_back_into_range() {
-        assert_eq!(
-            parse("{\"sidebar_width\": 5}").sidebar_width,
-            MIN_SIDEBAR_WIDTH
-        );
-        assert_eq!(
-            parse("{\"sidebar_width\": 99999}").sidebar_width,
-            MAX_SIDEBAR_WIDTH
-        );
-        assert_eq!(
-            parse("{\"sidebar_width\": -1}").sidebar_width,
-            MIN_SIDEBAR_WIDTH
-        );
-    }
-
-    #[test]
-    fn a_width_within_range_is_left_alone() {
-        assert_eq!(parse("{\"sidebar_width\": 420}").sidebar_width, 420);
-    }
-
-    #[test]
-    fn unknown_fields_are_ignored_so_a_newer_version_can_add_some() {
-        assert_eq!(
-            parse("{\"sidebar_width\": 420, \"future_option\": true}").sidebar_width,
-            420
-        );
-    }
-
-    #[test]
-    fn loading_with_nowhere_to_load_from_gives_defaults() {
-        assert_eq!(load(&FakeEnv::new(&[])), Settings::default());
-    }
-
-    #[test]
-    fn settings_survive_a_round_trip_through_a_real_file() {
-        // Exercises the parts unit tests of parse and serialize cannot reach: creating
-        // the directory, and reading back what was actually written.
-        let directory = std::env::temp_dir().join(format!("lave-settings-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        let env = FakeEnv::new(&[("XDG_CONFIG_HOME", &directory.to_string_lossy())]);
-
-        assert_eq!(load(&env), Settings::default(), "nothing stored yet");
-
-        save(
-            &env,
-            &Settings {
-                sidebar_width: 421,
+        let clamp = |width: i32| {
+            Settings {
+                sidebar_width: width,
                 ..Settings::default()
-            },
-        );
-        assert_eq!(load(&env).sidebar_width, 421);
+            }
+            .clamped()
+            .sidebar_width
+        };
 
-        // Storing something absurd still yields something usable on the way back.
-        save(
-            &env,
-            &Settings {
-                sidebar_width: -5,
-                ..Settings::default()
-            },
-        );
-        assert_eq!(load(&env).sidebar_width, MIN_SIDEBAR_WIDTH);
+        assert_eq!(clamp(5), MIN_SIDEBAR_WIDTH);
+        assert_eq!(clamp(99_999), MAX_SIDEBAR_WIDTH);
+        assert_eq!(clamp(-1), MIN_SIDEBAR_WIDTH);
+        assert_eq!(clamp(420), 420, "a width within range is left alone");
+    }
 
-        let _ = std::fs::remove_dir_all(&directory);
+    #[test]
+    fn a_column_width_is_stored_against_its_table_and_read_back() {
+        let mut settings = Settings::default();
+
+        assert!(settings.set_column_width("containers", "Image", 240));
+
+        assert_eq!(settings.column_width("containers", "Image"), Some(240));
+        assert_eq!(
+            settings.column_width("images", "Image"),
+            None,
+            "a column of the same name in another table is a different column"
+        );
+        assert_eq!(settings.column_width("containers", "Ports"), None);
+    }
+
+    #[test]
+    fn storing_the_width_a_column_already_has_reports_no_change() {
+        // Restoring a width makes GTK notify, which would otherwise write the store back
+        // on every render.
+        let mut settings = Settings::default();
+        assert!(settings.set_column_width("containers", "Image", 240));
+
+        assert!(!settings.set_column_width("containers", "Image", 240));
+        assert!(settings.set_column_width("containers", "Image", 241));
+    }
+
+    #[test]
+    fn a_negative_width_means_size_it_yourself_and_forgets_any_stored_one() {
+        let mut settings = Settings::default();
+        settings.set_column_width("containers", "Image", 240);
+
+        assert!(settings.set_column_width("containers", "Image", -1));
+        assert_eq!(settings.column_width("containers", "Image"), None);
+        assert!(
+            !settings.set_column_width("containers", "Image", -1),
+            "forgetting what was already forgotten changes nothing"
+        );
+    }
+
+    #[test]
+    fn an_absurd_column_width_is_brought_into_range_on_the_way_in() {
+        let mut settings = Settings::default();
+
+        settings.set_column_width("containers", "Image", 1);
+        settings.set_column_width("containers", "Ports", 99_999);
+
+        assert_eq!(
+            settings.column_width("containers", "Image"),
+            Some(MIN_COLUMN_WIDTH)
+        );
+        assert_eq!(
+            settings.column_width("containers", "Ports"),
+            Some(MAX_COLUMN_WIDTH)
+        );
+    }
+
+    #[test]
+    fn a_stored_width_from_elsewhere_is_brought_into_range_on_the_way_out() {
+        // Nothing stops the store being edited by hand, or by an older version.
+        let settings = Settings {
+            column_widths: ColumnWidths::from([(
+                "containers".to_owned(),
+                BTreeMap::from([("Image".to_owned(), 99_999), ("Ports".to_owned(), 0)]),
+            )]),
+            ..Settings::default()
+        }
+        .clamped();
+
+        assert_eq!(
+            settings.column_width("containers", "Image"),
+            Some(MAX_COLUMN_WIDTH)
+        );
+        assert_eq!(
+            settings.column_width("containers", "Ports"),
+            Some(MIN_COLUMN_WIDTH)
+        );
+    }
+
+    #[test]
+    fn a_width_for_a_table_that_no_longer_exists_is_kept_rather_than_discarded() {
+        // Whether a table is still rendered is decided where it is rendered; storage
+        // keeps whatever it was given, so a downgrade does not lose the user's drags.
+        let settings = Settings {
+            column_widths: ColumnWidths::from([(
+                "volumes".to_owned(),
+                BTreeMap::from([("Name".to_owned(), 200)]),
+            )]),
+            ..Settings::default()
+        }
+        .clamped();
+
+        assert_eq!(settings.column_width("volumes", "Name"), Some(200));
     }
 }

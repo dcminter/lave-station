@@ -242,6 +242,11 @@ pub struct LogChunk {
     pub bytes: Vec<u8>,
 }
 
+/// How much history the tail view asks for: enough to see what just happened, few
+/// enough that attaching to a chatty container is instant. The whole log is a
+/// deliberate choice the user makes in the viewer, not the default.
+pub const TAIL_LINES: usize = 500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogOptions {
     /// Keep the stream open and deliver new output as it arrives.
@@ -255,9 +260,7 @@ impl Default for LogOptions {
     fn default() -> Self {
         Self {
             follow: false,
-            // Enough to be useful, few enough that a chatty container does not stall the
-            // window while it loads.
-            tail: Some(2000),
+            tail: Some(TAIL_LINES),
             timestamps: false,
         }
     }

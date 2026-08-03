@@ -60,10 +60,37 @@ pub struct Row {
     pub cells: Vec<Cell>,
 }
 
+/// How a table opens, before the user sorts it themselves.
+///
+/// A user's own sort lasts for the session and no longer: it is not written to the
+/// settings store, so every launch starts from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortSpec {
+    pub column: &'static str,
+    pub descending: bool,
+}
+
+/// Identifies a table across renders, so column widths can be stored against it.
+/// Stable strings, not positions: a table that moves keeps its widths.
+pub const IMAGES: &str = "images";
+pub const CONTAINERS: &str = "containers";
+pub const PROCESS_LIST: &str = "process-list";
+
+/// Newest first, as `docker ps` itself lists them.
+const NEWEST_FIRST: SortSpec = SortSpec {
+    column: "Created",
+    descending: true,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
+    /// Stable identity, for storing column widths against.
+    pub id: &'static str,
     pub columns: Vec<Column>,
     pub rows: Vec<Row>,
+    /// The order it opens in. A column that is not in this table is ignored, leaving the
+    /// rows in the order they were built.
+    pub default_sort: Option<SortSpec>,
 }
 
 impl Table {
@@ -137,6 +164,7 @@ pub fn images(images: &[ImageSummary], containers: &[ContainerSummary], now: i64
         .collect();
 
     Table {
+        id: IMAGES,
         columns: vec![
             wide_column("Image"),
             column("ID"),
@@ -145,6 +173,7 @@ pub fn images(images: &[ImageSummary], containers: &[ContainerSummary], now: i64
             numeric_column("Containers"),
         ],
         rows,
+        default_sort: Some(NEWEST_FIRST),
     }
 }
 
@@ -198,6 +227,7 @@ pub fn process_list(containers: &[ContainerSummary], now: i64, include_stopped: 
         .collect();
 
     Table {
+        id: PROCESS_LIST,
         columns: vec![
             column("Container ID"),
             wide_column("Image"),
@@ -208,6 +238,7 @@ pub fn process_list(containers: &[ContainerSummary], now: i64, include_stopped: 
             wide_column("Names"),
         ],
         rows,
+        default_sort: Some(NEWEST_FIRST),
     }
 }
 
@@ -238,6 +269,7 @@ pub fn containers(containers: &[ContainerSummary], now: i64) -> Table {
         .collect();
 
     Table {
+        id: CONTAINERS,
         columns: vec![
             wide_column("Container"),
             column("State"),
@@ -246,6 +278,7 @@ pub fn containers(containers: &[ContainerSummary], now: i64) -> Table {
             numeric_column("Created"),
         ],
         rows,
+        default_sort: Some(NEWEST_FIRST),
     }
 }
 
@@ -572,6 +605,40 @@ mod tests {
     fn a_quiet_host_still_gets_a_table_shaped_table() {
         assert_eq!(visible_rows(0), MIN_VISIBLE_ROWS);
         assert_eq!(visible_rows(1), MIN_VISIBLE_ROWS);
+    }
+
+    #[test]
+    fn every_table_names_itself_so_its_column_widths_can_be_stored() {
+        let ids = [
+            images(&[], &[], NOW).id,
+            containers(&[], NOW).id,
+            process_list(&[], NOW, true).id,
+        ];
+
+        assert_eq!(ids, [IMAGES, CONTAINERS, PROCESS_LIST]);
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len(),
+            "two tables sharing an id would share each other's column widths"
+        );
+    }
+
+    #[test]
+    fn every_table_opens_newest_first_on_a_column_it_actually_has() {
+        for table in [
+            images(&[], &[], NOW),
+            containers(&[], NOW),
+            process_list(&[], NOW, true),
+        ] {
+            let sort = table.default_sort.expect("every table opens sorted");
+
+            assert!(sort.descending, "newest first means descending");
+            assert!(
+                table.column_titles().contains(&sort.column),
+                "{} sorts by a column it does not have",
+                table.id
+            );
+        }
     }
 
     #[test]

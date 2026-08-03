@@ -1,12 +1,13 @@
 //! Turns a [`DetailPage`] into widgets. No decisions here — see `lave_core::model::detail`.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use lave_core::model::detail::{ContainerFilter, DetailGroup, DetailPage};
 use lave_core::model::tree::NodeId;
 
-use crate::table_view::{self, SortOrder};
+use crate::table_view::{self, SortOrder, TableHandlers};
 
 /// Below this the groups will not sit two abreast, so the flow box folds to one column.
 const GROUP_MIN_WIDTH: i32 = 380;
@@ -19,10 +20,19 @@ pub struct Handlers {
     pub navigate: Rc<dyn Fn(NodeId)>,
     /// The running-only / all toggle was operated.
     pub set_show_stopped: Rc<dyn Fn(bool)>,
-    /// A table was re-sorted by the user.
-    pub sort_changed: Rc<dyn Fn(SortOrder)>,
-    /// A table row was right-clicked: offer that object's actions.
-    pub context: Rc<dyn Fn(NodeId, gtk::Widget, f64, f64)>,
+    /// Everything the table itself reports, already scoped to the table on this page.
+    pub table: TableHandlers,
+    /// The bulk-action button has been built: the window drives its sensitivity and
+    /// fills in its menu, both of which depend on what is checked at the time.
+    pub cog_ready: Rc<dyn Fn(gtk::MenuButton)>,
+}
+
+/// How the table on this page is currently viewed. Neither is part of the page itself:
+/// the sort lasts for the session, and the widths outlive the run.
+pub struct TableState {
+    pub sort: SortOrder,
+    /// By column title.
+    pub widths: BTreeMap<String, i32>,
 }
 
 /// Replace the pane's contents.
@@ -33,7 +43,7 @@ pub fn render(
     lead: &gtk::Box,
     body: &gtk::Box,
     detail: &DetailPage,
-    sort: &SortOrder,
+    state: &TableState,
     handlers: &Handlers,
 ) {
     table_view::clear(lead);
@@ -42,7 +52,7 @@ pub fn render(
     let table = detail
         .table
         .as_ref()
-        .map(|table| table_section(table, detail, sort, handlers));
+        .map(|table| table_section(table, detail, state, handlers));
 
     let leading = detail.table_first && table.is_some();
     lead.set_visible(leading);
@@ -80,7 +90,7 @@ fn clamped(child: &impl IsA<gtk::Widget>) -> adw::Clamp {
 fn table_section(
     table: &lave_core::model::table::Table,
     detail: &DetailPage,
-    sort: &SortOrder,
+    state: &TableState,
     handlers: &Handlers,
 ) -> gtk::Widget {
     let section = gtk::Box::builder()
@@ -88,17 +98,9 @@ fn table_section(
         .spacing(12)
         .build();
 
-    if let Some(filter) = &detail.table_filter {
-        section.append(&filter_toggle(filter, &handlers.set_show_stopped));
-    }
+    section.append(&table_header(detail, handlers));
 
-    let view = table_view::build(
-        table,
-        sort,
-        Rc::clone(&handlers.navigate),
-        Rc::clone(&handlers.sort_changed),
-        &handlers.context,
-    );
+    let view = table_view::build(table, &state.sort, &state.widths, &handlers.table);
 
     let frame = gtk::Frame::new(None);
     frame.add_css_class("view");
@@ -119,6 +121,34 @@ fn table_section(
 
     section.append(&frame);
     section.upcast()
+}
+
+/// The strip above a table: bulk actions on the left, the filter on the right.
+fn table_header(detail: &DetailPage, handlers: &Handlers) -> gtk::Box {
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    // Insensitive until something is checked, which is the window's business: what is
+    // checked outlives this widget.
+    let cog = gtk::MenuButton::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Act on the checked rows")
+        .valign(gtk::Align::Center)
+        .build();
+    cog.add_css_class("flat");
+    cog.update_property(&[gtk::accessible::Property::Label("Act on the checked rows")]);
+    header.append(&cog);
+    (handlers.cog_ready)(cog);
+
+    if let Some(filter) = &detail.table_filter {
+        let toggle = filter_toggle(filter, &handlers.set_show_stopped);
+        toggle.set_hexpand(true);
+        header.append(&toggle);
+    }
+
+    header
 }
 
 /// Two linked toggle buttons, in the manner of a view switcher.
