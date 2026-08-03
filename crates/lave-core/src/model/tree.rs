@@ -98,12 +98,23 @@ impl Tone {
 pub struct TreeNode {
     pub id: NodeId,
     pub label: String,
-    /// Dimmed secondary text.
-    pub detail: Option<String>,
+    /// Spoken by screen readers, and not shown: the sidebar names an object by its label
+    /// alone. Counts and states are on the object's own page, where they are read rather
+    /// than glanced at, and where they cannot go stale.
+    pub description: Option<String>,
     /// Symbolic icon name from the Adwaita theme.
     pub icon: &'static str,
     pub tone: Tone,
     pub children: Vec<TreeNode>,
+}
+
+impl TreeNode {
+    /// The child standing for `id`. Callers ask by identity rather than by position, so
+    /// reordering the sidebar cannot silently swap what they are looking at.
+    #[must_use]
+    pub fn child(&self, id: &NodeId) -> Option<&TreeNode> {
+        self.children.iter().find(|child| child.id == *id)
+    }
 }
 
 const ICON_ROOT: &str = "network-server-symbolic";
@@ -168,12 +179,14 @@ pub fn build(
     TreeNode {
         id: NodeId::Root,
         label: root_label(environment),
-        detail: environment
+        description: environment
             .map(|environment| environment.server_version.clone())
             .filter(|version| !version.is_empty()),
         icon: ICON_ROOT,
         tone: Tone::Brand,
-        children: vec![images_node(images), containers_node(containers)],
+        // Containers first: they are what changes, and what a person opens this to look
+        // at. Images are the material those are made from.
+        children: vec![containers_node(containers), images_node(images)],
     }
 }
 
@@ -213,7 +226,7 @@ fn images_node(images: &[ImageSummary]) -> TreeNode {
             id: NodeId::Image(image.id.clone()),
             label: image_label(image),
             // Nothing: the tag names it, and when there is no tag the label is the ID.
-            detail: None,
+            description: None,
             icon: ICON_IMAGE,
             // Untagged images are usually residue left by a tag moving elsewhere.
             tone: if is_untagged(image) {
@@ -228,7 +241,7 @@ fn images_node(images: &[ImageSummary]) -> TreeNode {
     TreeNode {
         id: NodeId::Images,
         label: "Images".to_owned(),
-        detail: Some(images.len().to_string()),
+        description: Some(images.len().to_string()),
         icon: ICON_IMAGES,
         tone: Tone::Images,
         children,
@@ -249,7 +262,7 @@ fn containers_node(containers: &[ContainerSummary]) -> TreeNode {
         .map(|container| TreeNode {
             id: NodeId::Container(container.id.clone()),
             label: container_label(container),
-            detail: Some(container.state.label().to_owned()),
+            description: Some(container.state.label().to_owned()),
             icon: state_icon(&container.state),
             tone: state_tone(&container.state),
             children: Vec::new(),
@@ -260,7 +273,7 @@ fn containers_node(containers: &[ContainerSummary]) -> TreeNode {
         .iter()
         .filter(|container| container.state.is_active())
         .count();
-    let detail = if running == 0 {
+    let description = if running == 0 {
         containers.len().to_string()
     } else {
         format!("{} ({running} running)", containers.len())
@@ -269,7 +282,7 @@ fn containers_node(containers: &[ContainerSummary]) -> TreeNode {
     TreeNode {
         id: NodeId::Containers,
         label: "Containers".to_owned(),
-        detail: Some(detail),
+        description: Some(description),
         icon: ICON_CONTAINERS,
         tone: Tone::Containers,
         children,
@@ -313,6 +326,20 @@ mod tests {
         }
     }
 
+    /// The standing nodes by identity, so the order they are listed in is asserted in
+    /// one place rather than assumed by every test.
+    fn node<'a>(tree: &'a TreeNode, id: &NodeId) -> &'a TreeNode {
+        tree.child(id).expect("the standing node is present")
+    }
+
+    fn sidebar_images(tree: &TreeNode) -> &TreeNode {
+        node(tree, &NodeId::Images)
+    }
+
+    fn sidebar_containers(tree: &TreeNode) -> &TreeNode {
+        node(tree, &NodeId::Containers)
+    }
+
     fn labels(node: &TreeNode) -> Vec<&str> {
         node.children
             .iter()
@@ -325,9 +352,18 @@ mod tests {
         let tree = build(None, &[], &[]);
 
         assert_eq!(tree.id, NodeId::Root);
-        assert_eq!(labels(&tree), vec!["Images", "Containers"]);
-        assert_eq!(tree.children[0].id, NodeId::Images);
-        assert_eq!(tree.children[1].id, NodeId::Containers);
+        assert_eq!(labels(&tree), vec!["Containers", "Images"]);
+    }
+
+    #[test]
+    fn containers_are_listed_before_images() {
+        // Containers are what changes, and what a person opens this application to look
+        // at; images are the material those are made from. The whole widget layer takes
+        // the order from here, so this is the only place it is decided.
+        let tree = build(None, &[], &[]);
+
+        assert_eq!(tree.children[0].id, NodeId::Containers);
+        assert_eq!(tree.children[1].id, NodeId::Images);
     }
 
     #[test]
@@ -341,7 +377,7 @@ mod tests {
         let tree = build(Some(&environment), &[], &[]);
 
         assert_eq!(tree.label, "workstation");
-        assert_eq!(tree.detail.as_deref(), Some("29.6.2"));
+        assert_eq!(tree.description.as_deref(), Some("29.6.2"));
     }
 
     #[test]
@@ -349,7 +385,7 @@ mod tests {
         let tree = build(None, &[], &[]);
 
         assert_eq!(tree.label, "Docker");
-        assert_eq!(tree.detail, None);
+        assert_eq!(tree.description, None);
     }
 
     #[test]
@@ -373,7 +409,7 @@ mod tests {
         let tree = build(None, &images, &[]);
 
         assert_eq!(
-            labels(&tree.children[0]),
+            labels(sidebar_images(&tree)),
             vec!["alpine:3.20", "nginx:1.27", "Zebra:latest"]
         );
     }
@@ -382,22 +418,26 @@ mod tests {
     fn untagged_images_are_listed_by_id_rather_than_a_placeholder() {
         let images = [image("aaa", ""), image("bbb", "")];
 
-        let node = &build(None, &images, &[]).children[0];
+        let tree = build(None, &images, &[]);
+        let node = sidebar_images(&tree);
 
         assert_eq!(labels(node), vec!["aaa", "bbb"]);
         assert_ne!(node.children[0].id, node.children[1].id);
     }
 
     #[test]
-    fn image_rows_carry_no_secondary_text_at_all() {
+    fn image_rows_carry_nothing_beyond_their_name() {
         // A tagged image is named by its tag; the ID beside it was just noise.
         let images = [image("aaa", "nginx:1.27"), image("bbb", "")];
 
-        let node = &build(None, &images, &[]).children[0];
+        let tree = build(None, &images, &[]);
+        let node = sidebar_images(&tree);
 
         assert!(
-            node.children.iter().all(|child| child.detail.is_none()),
-            "no image row should have secondary text"
+            node.children
+                .iter()
+                .all(|child| child.description.is_none()),
+            "no image row should carry a description"
         );
     }
 
@@ -410,7 +450,8 @@ mod tests {
             image("ddd", "alpine:3.20"),
         ];
 
-        let node = &build(None, &images, &[]).children[0];
+        let tree = build(None, &images, &[]);
+        let node = sidebar_images(&tree);
 
         assert_eq!(
             labels(node),
@@ -426,7 +467,8 @@ mod tests {
             image_at("mid", "", 2_000),
         ];
 
-        let node = &build(None, &images, &[]).children[0];
+        let tree = build(None, &images, &[]);
+        let node = sidebar_images(&tree);
 
         assert_eq!(labels(node), vec!["new", "mid", "old"]);
     }
@@ -438,7 +480,8 @@ mod tests {
             image_at("bbb", "alpine:1", 1_000),
         ];
 
-        let node = &build(None, &images, &[]).children[0];
+        let tree = build(None, &images, &[]);
+        let node = sidebar_images(&tree);
 
         assert_eq!(labels(node), vec!["alpine:1", "zebra:1"]);
     }
@@ -447,7 +490,8 @@ mod tests {
     fn an_untagged_image_is_marked_as_worth_a_look() {
         let images = [image("aaa", ""), image("bbb", "nginx:1.27")];
 
-        let node = &build(None, &images, &[]).children[0];
+        let tree = build(None, &images, &[]);
+        let node = sidebar_images(&tree);
 
         assert_eq!(node.children[0].tone, Tone::Neutral, "nginx sorts first");
         assert_eq!(node.children[1].tone, Tone::Warn);
@@ -461,7 +505,8 @@ mod tests {
             container("c3", "mike", ContainerState::Exited),
         ];
 
-        let node = &build(None, &[], &containers).children[1];
+        let tree = build(None, &[], &containers);
+        let node = sidebar_containers(&tree);
 
         assert_eq!(labels(node), vec!["alpha", "mike", "Zulu"]);
     }
@@ -482,8 +527,8 @@ mod tests {
         let tree = build(None, &[], &[]);
 
         assert_eq!(tree.tone, Tone::Brand, "the daemon gets Docker's own blue");
-        assert_eq!(tree.children[0].tone, Tone::Images);
-        assert_eq!(tree.children[1].tone, Tone::Containers);
+        assert_eq!(sidebar_images(&tree).tone, Tone::Images);
+        assert_eq!(sidebar_containers(&tree).tone, Tone::Containers);
     }
 
     #[test]
@@ -515,31 +560,38 @@ mod tests {
     }
 
     #[test]
-    fn each_node_carries_the_count_of_its_children() {
+    fn the_top_level_nodes_are_named_plainly_whatever_they_hold() {
+        // The counts used to sit beside these labels and went stale, since a node object
+        // is updated in place and nothing re-binds the row that shows it.
         let images = [image("aaa", "one:1"), image("bbb", "two:2")];
         let containers = [container("c1", "web", ContainerState::Exited)];
 
         let tree = build(None, &images, &containers);
 
-        assert_eq!(tree.children[0].detail.as_deref(), Some("2"));
-        assert_eq!(tree.children[1].detail.as_deref(), Some("1"));
+        assert_eq!(sidebar_images(&tree).label, "Images");
+        assert_eq!(sidebar_containers(&tree).label, "Containers");
     }
 
     #[test]
-    fn the_container_count_calls_out_running_ones() {
+    fn each_node_describes_its_contents_for_a_screen_reader() {
+        let images = [image("aaa", "one:1"), image("bbb", "two:2")];
         let containers = [
             container("c1", "web", ContainerState::Running),
             container("c2", "db", ContainerState::Exited),
             container("c3", "cache", ContainerState::Paused),
         ];
 
-        let tree = build(None, &[], &containers);
+        let tree = build(None, &images, &containers);
 
-        assert_eq!(tree.children[1].detail.as_deref(), Some("3 (2 running)"));
+        assert_eq!(sidebar_images(&tree).description.as_deref(), Some("2"));
+        assert_eq!(
+            sidebar_containers(&tree).description.as_deref(),
+            Some("3 (2 running)")
+        );
     }
 
     #[test]
-    fn containers_show_their_state_as_text_and_as_a_distinct_icon() {
+    fn containers_show_their_state_as_a_distinct_icon_and_say_it_in_words() {
         let containers = [
             container("c1", "runner", ContainerState::Running),
             container("c2", "sleeper", ContainerState::Exited),
@@ -547,7 +599,8 @@ mod tests {
             container("c4", "broken", ContainerState::Dead),
         ];
 
-        let node = &build(None, &[], &containers).children[1];
+        let tree = build(None, &[], &containers);
+        let node = sidebar_containers(&tree);
         let by_label = |label: &str| {
             node.children
                 .iter()
@@ -556,7 +609,7 @@ mod tests {
                 .clone()
         };
 
-        assert_eq!(by_label("runner").detail.as_deref(), Some("running"));
+        assert_eq!(by_label("runner").description.as_deref(), Some("running"));
         assert_eq!(by_label("runner").icon, ICON_RUNNING);
         assert_eq!(by_label("sleeper").icon, ICON_STOPPED);
         assert_eq!(by_label("held").icon, ICON_PAUSED);
@@ -571,7 +624,8 @@ mod tests {
             ContainerState::Exited,
         )];
 
-        let node = &build(None, &[], &containers).children[1];
+        let tree = build(None, &[], &containers);
+        let node = sidebar_containers(&tree);
 
         assert_eq!(labels(node), vec!["13ef39df585f"]);
     }
@@ -580,9 +634,9 @@ mod tests {
     fn empty_listings_produce_empty_nodes_rather_than_missing_ones() {
         let tree = build(None, &[], &[]);
 
-        assert!(tree.children[0].children.is_empty());
-        assert!(tree.children[1].children.is_empty());
-        assert_eq!(tree.children[0].detail.as_deref(), Some("0"));
+        assert!(sidebar_images(&tree).children.is_empty());
+        assert!(sidebar_containers(&tree).children.is_empty());
+        assert_eq!(sidebar_images(&tree).description.as_deref(), Some("0"));
     }
 
     #[test]

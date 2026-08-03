@@ -125,6 +125,12 @@ which reads as success.
 
 ## 3. Icons in the menus
 
+> **This section was wrong, and version 5 replaced what it describes.** The check below
+> confirmed that an item with an icon gets a `GtkImage` child and one without does not —
+> which is true, and does not mean the image is ever drawn. `GtkModelButton` hides its
+> image whenever the item also has a label, so none of these icons appeared. See
+> [the iteration 5 plan](./iteration_5_plan.md) §2.
+
 `GtkPopoverMenu` does honour the `GMenu` `icon` attribute — checked with a throwaway
 GTK program before any of this was written, because the documentation is not explicit
 and the horizontal-buttons section hint suggests otherwise. An item with an icon gets a

@@ -182,6 +182,62 @@ pub fn for_image(image: &ImageSummary, containers: &[ContainerSummary]) -> Vec<O
     ]
 }
 
+/// How much of a listing is checked, which is what the select-all control shows and what
+/// decides whether the cog beside it has anything to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tally {
+    pub rows: usize,
+    pub checked: usize,
+}
+
+impl Tally {
+    /// More checked than there are rows cannot happen, but clamping keeps the three
+    /// states below mutually exclusive whatever is passed in.
+    #[must_use]
+    pub fn new(rows: usize, checked: usize) -> Self {
+        Self {
+            rows,
+            checked: checked.min(rows),
+        }
+    }
+
+    /// Nothing to check: the listing is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    /// Something is checked, so a bulk action has a target.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.checked > 0
+    }
+
+    /// Some but not all — the mixed state a check button draws as a dash.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        self.any() && self.checked < self.rows
+    }
+
+    /// Everything present is checked.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.is_empty() && self.checked == self.rows
+    }
+
+    /// What operating the select-all control would do, said before it is clicked.
+    #[must_use]
+    pub fn select_all_label(&self) -> &'static str {
+        if self.is_empty() {
+            "There is nothing to check"
+        } else if self.is_complete() {
+            "Uncheck every row"
+        } else {
+            "Check every row"
+        }
+    }
+}
+
 /// One object a bulk action will be applied to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkTarget {
@@ -719,6 +775,59 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn an_empty_listing_has_nothing_to_check() {
+        let tally = Tally::new(0, 0);
+
+        assert!(tally.is_empty());
+        assert!(!tally.any());
+        assert!(!tally.is_partial());
+        assert!(!tally.is_complete());
+        assert_eq!(tally.select_all_label(), "There is nothing to check");
+    }
+
+    #[test]
+    fn a_listing_with_nothing_checked_offers_to_check_everything() {
+        let tally = Tally::new(4, 0);
+
+        assert!(!tally.any());
+        assert!(!tally.is_partial());
+        assert!(!tally.is_complete());
+        assert_eq!(tally.select_all_label(), "Check every row");
+    }
+
+    #[test]
+    fn a_part_checked_listing_is_neither_checked_nor_unchecked() {
+        let tally = Tally::new(4, 1);
+
+        assert!(tally.any());
+        assert!(tally.is_partial());
+        assert!(!tally.is_complete());
+        // Half-checked, the useful next move is still to check the rest.
+        assert_eq!(tally.select_all_label(), "Check every row");
+    }
+
+    #[test]
+    fn a_fully_checked_listing_offers_to_clear_itself() {
+        let tally = Tally::new(4, 4);
+
+        assert!(tally.any());
+        assert!(!tally.is_partial());
+        assert!(tally.is_complete());
+        assert_eq!(tally.select_all_label(), "Uncheck every row");
+    }
+
+    #[test]
+    fn more_checked_than_present_cannot_report_a_mixed_state() {
+        // Ticks outlive the objects they were made against for a moment, between an
+        // action landing and the listing that follows it.
+        let tally = Tally::new(2, 5);
+
+        assert_eq!(tally.checked, 2);
+        assert!(tally.is_complete());
+        assert!(!tally.is_partial());
+    }
 
     fn container(name: &str, state: ContainerState) -> ContainerSummary {
         ContainerSummary {

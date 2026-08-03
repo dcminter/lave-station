@@ -17,8 +17,9 @@ mod imp {
         pub key: RefCell<String>,
         #[property(get, set)]
         pub label: RefCell<String>,
+        /// Not shown: it is the row's accessible description and nothing else.
         #[property(get, set)]
-        pub detail: RefCell<String>,
+        pub description: RefCell<String>,
         #[property(get, set)]
         pub icon: RefCell<String>,
         /// CSS class carrying the icon's colour.
@@ -52,7 +53,7 @@ impl TreeNodeObject {
     pub fn apply(&self, node: &TreeNode) {
         self.set_key(node.id.key());
         self.set_label(node.label.clone());
-        self.set_detail(node.detail.clone().unwrap_or_default());
+        self.set_description(node.description.clone().unwrap_or_default());
         self.set_icon(node.icon);
         self.set_tone(node.tone.css_class());
     }

@@ -6,6 +6,7 @@ pub mod detail;
 pub mod dockerfile;
 pub mod format;
 pub mod fs_tree;
+pub mod layout;
 pub mod logs;
 pub mod relations;
 pub mod table;

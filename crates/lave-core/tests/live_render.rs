@@ -9,6 +9,7 @@
 use lave_core::endpoint::{SystemEnv, SystemPaths, resolve};
 use lave_core::engine::{ContainerEngine, bollard_engine::BollardEngine};
 use lave_core::model::relations::{self, LayerIndex};
+use lave_core::model::tree::NodeId;
 use lave_core::model::{detail, dockerfile, tree};
 
 fn utc() -> chrono::FixedOffset {
@@ -23,6 +24,21 @@ fn now() -> i64 {
             .as_secs(),
     )
     .expect("the current time fits in i64")
+}
+
+fn print_tree(root: &tree::TreeNode) {
+    let spoken = |node: &tree::TreeNode| node.description.clone().unwrap_or_default();
+
+    println!("\n{} ({})", root.label, spoken(root));
+    for node in &root.children {
+        println!("  {} [{}]", node.label, spoken(node));
+        for child in node.children.iter().take(3) {
+            println!("    {} ({})", child.label, spoken(child));
+        }
+        if node.children.len() > 3 {
+            println!("    ... {} more", node.children.len() - 3);
+        }
+    }
 }
 
 fn print_page(page: &detail::DetailPage) {
@@ -84,42 +100,25 @@ async fn the_whole_read_path_produces_sensible_output() {
         now: now(),
         offset: utc(),
         show_stopped: true,
+        show_untagged: true,
     };
 
     // The tree the sidebar will show.
     let root = tree::build(Some(&environment), &images, &containers);
-    println!(
-        "\n{} ({})",
-        root.label,
-        root.detail.clone().unwrap_or_default()
-    );
-    for node in &root.children {
-        println!(
-            "  {} [{}]",
-            node.label,
-            node.detail.clone().unwrap_or_default()
-        );
-        for child in node.children.iter().take(3) {
-            println!(
-                "    {} ({})",
-                child.label,
-                child.detail.clone().unwrap_or_default()
-            );
-        }
-        if node.children.len() > 3 {
-            println!("    ... {} more", node.children.len() - 3);
-        }
-    }
+    print_tree(&root);
 
     assert_eq!(root.children.len(), 2);
+    // By identity, not by position: which of the two comes first is `tree`'s decision and
+    // is asserted there.
     assert_eq!(
-        root.children[0].children.len(),
-        images.len(),
+        root.child(&NodeId::Images).map(|node| node.children.len()),
+        Some(images.len()),
         "every image should appear in the tree"
     );
     assert_eq!(
-        root.children[1].children.len(),
-        containers.len(),
+        root.child(&NodeId::Containers)
+            .map(|node| node.children.len()),
+        Some(containers.len()),
         "every container should appear in the tree"
     );
 

@@ -279,19 +279,6 @@ fn build_check_column(handlers: &TableHandlers) -> gtk::ColumnViewColumn {
         .build()
 }
 
-/// Drop the gestures `bind` attached, so a recycled cell starts clean.
-fn clear_gestures(child: &gtk::Widget) {
-    let controllers = child.observe_controllers();
-    // Collected first: removing while iterating the live model would skip entries.
-    let gestures: Vec<gtk::GestureClick> = (0..controllers.n_items())
-        .filter_map(|index| controllers.item(index).and_downcast::<gtk::GestureClick>())
-        .collect();
-
-    for gesture in gestures {
-        child.remove_controller(&gesture);
-    }
-}
-
 /// Restore a stored sort. A column title that no longer exists is simply not applied.
 fn apply_sort(view: &gtk::ColumnView, sort: &SortOrder) {
     if sort.column.is_empty() {
@@ -348,6 +335,7 @@ fn build_column(
     // Only the first column names the object, so only it carries the icon.
     let with_icon = index == 0;
 
+    let on_context = Rc::clone(on_context);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -358,7 +346,7 @@ fn build_column(
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build();
 
-        if with_icon {
+        let child: gtk::Widget = if with_icon {
             let content = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .spacing(8)
@@ -366,14 +354,47 @@ fn build_column(
             content.append(&gtk::Image::new());
             content.append(&label);
             content.add_css_class("table-cell");
-            item.set_child(Some(&content));
+            content.upcast()
         } else {
             label.add_css_class("table-cell");
-            item.set_child(Some(&label));
-        }
+            label.upcast()
+        };
+
+        // Attached once and asking the list item which row it holds when it fires, rather
+        // than attached per bind and torn down per unbind: a recycled cell then cannot end
+        // up with no gesture, or with two.
+        //
+        // `ColumnViewRow` would be the natural home but is not a widget, so cannot carry
+        // a controller.
+        let secondary = gtk::GestureClick::new();
+        secondary.set_button(gtk::gdk::BUTTON_SECONDARY);
+        let on_context = Rc::clone(&on_context);
+        secondary.connect_pressed(glib::clone!(
+            #[weak]
+            item,
+            move |gesture, _, x, y| {
+                let Some(node) = item
+                    .item()
+                    .and_downcast::<TableRowObject>()
+                    .and_then(|row| row.key())
+                else {
+                    return;
+                };
+                // Claiming stops the row's own click gesture seeing this press. It takes
+                // any button, so without this a right-click also selected and — with
+                // single-click activation — activated the row, which navigates and rebuilds
+                // the pane out from under the menu that was about to open.
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(widget) = gesture.widget() {
+                    on_context(node, widget, x, y);
+                }
+            }
+        ));
+        child.add_controller(secondary);
+
+        item.set_child(Some(&child));
     });
 
-    let on_context = Rc::clone(on_context);
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -384,22 +405,6 @@ fn build_column(
         let Some(child) = item.child() else {
             return;
         };
-
-        // Attached here rather than in setup because only now is the row known, and
-        // removed again in unbind so a recycled cell does not accumulate gestures.
-        // `ColumnViewRow` would be the natural home but is not a widget, so cannot
-        // carry a controller.
-        if let Some(node) = row.key() {
-            let secondary = gtk::GestureClick::new();
-            secondary.set_button(gtk::gdk::BUTTON_SECONDARY);
-            let on_context = Rc::clone(&on_context);
-            secondary.connect_pressed(move |gesture, _, x, y| {
-                if let Some(widget) = gesture.widget() {
-                    on_context(node.clone(), widget, x, y);
-                }
-            });
-            child.add_controller(secondary);
-        }
 
         let label = if with_icon {
             let Some(content) = child.downcast_ref::<gtk::Box>() else {
@@ -419,14 +424,6 @@ fn build_column(
             let text = row.cell_text(index);
             label.set_tooltip_text(Some(&text));
             label.set_label(&text);
-        }
-    });
-
-    factory.connect_unbind(|_, item| {
-        if let Some(item) = item.downcast_ref::<gtk::ListItem>()
-            && let Some(child) = item.child()
-        {
-            clear_gestures(&child);
         }
     });
 

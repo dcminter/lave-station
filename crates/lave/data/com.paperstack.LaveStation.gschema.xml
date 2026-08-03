@@ -15,10 +15,20 @@
 
     <key name="show-stopped-containers" type="b">
       <default>true</default>
-      <summary>Include stopped containers in the environment table</summary>
+      <summary>Include stopped containers in the container tables</summary>
       <description>
         Corresponds to docker ps -a. With this off, only containers that are actually
-        executing are listed.
+        executing are listed. One setting for both pages that list containers, since it
+        is one question.
+      </description>
+    </key>
+
+    <key name="show-untagged-images" type="b">
+      <default>true</default>
+      <summary>Include untagged images in the image table</summary>
+      <description>
+        Untagged images are usually residue left behind when a tag moved elsewhere. With
+        this off, only images carrying at least one tag are listed.
       </description>
     </key>
 

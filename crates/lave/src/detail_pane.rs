@@ -4,13 +4,12 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use lave_core::model::detail::{ContainerFilter, DetailGroup, DetailPage};
+use lave_core::model::detail::{DetailGroup, DetailPage, FilterKind, TableFilter};
 use lave_core::model::tree::NodeId;
 
+use crate::group_columns::GroupColumns;
 use crate::table_view::{self, SortOrder, TableHandlers};
 
-/// Below this the groups will not sit two abreast, so the flow box folds to one column.
-const GROUP_MIN_WIDTH: i32 = 380;
 /// Groups are clamped for readability; tables are not, since width is the point of them.
 const GROUP_CLAMP_WIDTH: i32 = 1500;
 
@@ -18,13 +17,16 @@ const GROUP_CLAMP_WIDTH: i32 = 1500;
 pub struct Handlers {
     /// A row or link was chosen: select that object in the sidebar.
     pub navigate: Rc<dyn Fn(NodeId)>,
-    /// The running-only / all toggle was operated.
-    pub set_show_stopped: Rc<dyn Fn(bool)>,
+    /// A table's filter toggle was operated: the kind of filter, and whether the rows it
+    /// would leave out are now wanted.
+    pub set_filter: Rc<dyn Fn(FilterKind, bool)>,
     /// Everything the table itself reports, already scoped to the table on this page.
     pub table: TableHandlers,
     /// The bulk-action button has been built: the window drives its sensitivity and
     /// fills in its menu, both of which depend on what is checked at the time.
     pub cog_ready: Rc<dyn Fn(gtk::MenuButton)>,
+    /// Likewise the select-all control, whose own state is a summary of the row ticks.
+    pub select_all_ready: Rc<dyn Fn(gtk::CheckButton)>,
 }
 
 /// How the table on this page is currently viewed. Neither is part of the page itself:
@@ -64,7 +66,7 @@ pub fn render(
     }
 
     if !detail.groups.is_empty() {
-        body.append(&clamped(&group_flow(&detail.groups, &handlers.navigate)));
+        body.append(&clamped(&group_columns(&detail.groups, &handlers.navigate)));
     }
 
     if let Some(table) = &table
@@ -123,12 +125,25 @@ fn table_section(
     section.upcast()
 }
 
-/// The strip above a table: bulk actions on the left, the filter on the right.
+/// The strip above a table: select-all and bulk actions on the left, the filter on the
+/// right.
 fn table_header(detail: &DetailPage, handlers: &Handlers) -> gtk::Box {
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
+
+    // Lines up with the column of row checkboxes below it, so what it governs is legible
+    // without a label. Its three states are the window's business.
+    let select_all = gtk::CheckButton::builder()
+        .tooltip_text("Check every row")
+        .valign(gtk::Align::Center)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    select_all.update_property(&[gtk::accessible::Property::Label("Check every row")]);
+    header.append(&select_all);
+    (handlers.select_all_ready)(select_all);
 
     // Insensitive until something is checked, which is the window's business: what is
     // checked outlives this widget.
@@ -143,7 +158,7 @@ fn table_header(detail: &DetailPage, handlers: &Handlers) -> gtk::Box {
     (handlers.cog_ready)(cog);
 
     if let Some(filter) = &detail.table_filter {
-        let toggle = filter_toggle(filter, &handlers.set_show_stopped);
+        let toggle = filter_toggle(filter, &handlers.set_filter);
         toggle.set_hexpand(true);
         header.append(&toggle);
     }
@@ -152,75 +167,66 @@ fn table_header(detail: &DetailPage, handlers: &Handlers) -> gtk::Box {
 }
 
 /// Two linked toggle buttons, in the manner of a view switcher.
-fn filter_toggle(filter: &ContainerFilter, set_show_stopped: &Rc<dyn Fn(bool)>) -> gtk::Box {
+fn filter_toggle(filter: &TableFilter, set_filter: &Rc<dyn Fn(FilterKind, bool)>) -> gtk::Box {
     let holder = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .halign(gtk::Align::End)
         .build();
 
-    let running = gtk::ToggleButton::builder()
-        .label(&filter.running_label)
+    let narrow = gtk::ToggleButton::builder()
+        .label(&filter.narrow_label)
         .active(!filter.showing_all)
         .build();
     let all = gtk::ToggleButton::builder()
         .label(&filter.all_label)
         .active(filter.showing_all)
-        .group(&running)
+        .group(&narrow)
         .build();
 
     let buttons = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .build();
     buttons.add_css_class("linked");
-    buttons.append(&running);
+    buttons.append(&narrow);
     buttons.append(&all);
     holder.append(&buttons);
 
     // Only act on the button becoming active, so the pair reports one change, not two.
-    let handler = Rc::clone(set_show_stopped);
-    running.connect_toggled(move |button| {
-        if button.is_active() {
-            handler(false);
-        }
-    });
-    let handler = Rc::clone(set_show_stopped);
-    all.connect_toggled(move |button| {
-        if button.is_active() {
-            handler(true);
-        }
-    });
+    for (button, showing_all) in [(&narrow, false), (&all, true)] {
+        let handler = Rc::clone(set_filter);
+        let kind = filter.kind;
+        button.connect_toggled(move |button| {
+            if button.is_active() {
+                handler(kind, showing_all);
+            }
+        });
+    }
 
     holder
 }
 
-/// Groups laid out in as many columns as the width allows, at most two. `AdwWrapBox`
-/// would be the natural fit but arrived in libadwaita 1.7, above this application's
-/// floor of 1.5, so a flow box does the same job.
-fn group_flow(groups: &[DetailGroup], on_navigate: &Rc<dyn Fn(NodeId)>) -> gtk::FlowBox {
-    let flow = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .min_children_per_line(1)
-        .max_children_per_line(2)
-        .homogeneous(true)
-        .row_spacing(18)
-        .column_spacing(18)
-        .build();
+/// Groups laid out in as many columns as the width allows, at most two, each group only
+/// as tall as its own contents.
+///
+/// A flow box was the obvious widget and is the wrong one: it lays out in lines and gives
+/// every child in a line the height of the tallest, so a group of two rows beside one of
+/// fifteen was allocated the height of the fifteen and left a crater below itself.
+/// `AdwWrapBox` has the same line-based problem, and arrived in libadwaita 1.7 besides,
+/// above this application's floor of 1.5.
+fn group_columns(groups: &[DetailGroup], on_navigate: &Rc<dyn Fn(NodeId)>) -> GroupColumns {
+    let columns = GroupColumns::new();
 
     for group in groups {
-        let widget = adw::PreferencesGroup::builder()
-            .title(&group.title)
-            .width_request(GROUP_MIN_WIDTH)
-            .valign(gtk::Align::Start)
-            .build();
+        let widget = adw::PreferencesGroup::builder().title(&group.title).build();
 
         for row in &group.rows {
             widget.add(&action_row(row, on_navigate));
         }
 
-        flow.append(&widget);
+        columns.append(&widget);
     }
 
-    flow
+    columns
 }
 
 fn action_row(

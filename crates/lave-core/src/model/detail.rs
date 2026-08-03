@@ -29,12 +29,23 @@ pub struct DetailGroup {
     pub rows: Vec<DetailRow>,
 }
 
-/// The running-only / everything toggle offered above a container table.
+/// Which listing a table's filter narrows, and so which preference it drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterKind {
+    /// Leave out containers that are not running.
+    StoppedContainers,
+    /// Leave out images carrying no tag.
+    UntaggedImages,
+}
+
+/// The narrowed / everything toggle offered above a table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerFilter {
-    /// True when stopped containers are included.
+pub struct TableFilter {
+    pub kind: FilterKind,
+    /// True when the rows the filter would leave out are included.
     pub showing_all: bool,
-    pub running_label: String,
+    /// The narrowed view, with its count: "Running (3)", "Tagged (12)".
+    pub narrow_label: String,
     pub all_label: String,
     /// Rows the table should be given before the user drags it. See
     /// [`super::table::visible_rows`].
@@ -52,7 +63,7 @@ pub struct DetailPage {
     /// Whether the table leads the page or follows the groups.
     pub table_first: bool,
     /// When set, the table is offered with a filter toggle above it.
-    pub table_filter: Option<ContainerFilter>,
+    pub table_filter: Option<TableFilter>,
     /// Pretty-printed inspect output, shown in a collapsed expander.
     pub raw: Option<String>,
     /// What the user may do to this object, decided in [`crate::model::action`].
@@ -69,8 +80,10 @@ pub struct Context<'a> {
     /// Seconds since the Unix epoch, injected so rendering is deterministic.
     pub now: i64,
     pub offset: chrono::FixedOffset,
-    /// Whether the environment page's container table includes stopped containers.
+    /// Whether container tables include the ones that are not running.
     pub show_stopped: bool,
+    /// Whether the image table includes the ones carrying no tag.
+    pub show_untagged: bool,
 }
 
 impl DetailPage {
@@ -145,11 +158,7 @@ pub fn environment(
     resolved: &Resolved,
     cx: &Context<'_>,
 ) -> DetailPage {
-    let running = cx
-        .containers
-        .iter()
-        .filter(|container| container.state.is_active())
-        .count();
+    let running = count_running(cx.containers);
 
     let mut groups = vec![
         connection_group(environment, resolved),
@@ -197,14 +206,24 @@ pub fn environment(
         // The containers are what a person opens this application to look at; the
         // daemon's own metadata is reference material below them.
         table_first: true,
-        table_filter: Some(ContainerFilter {
-            showing_all: cx.show_stopped,
-            running_label: format!("Running ({running})"),
-            all_label: format!("All ({})", cx.containers.len()),
-            visible_rows: table::visible_rows(running),
-        }),
+        table_filter: Some(running_filter(cx, running)),
         raw: raw_json(cx.raw),
         actions: action::for_environment(cx.containers, cx.images),
+    }
+}
+
+/// The running-only / everything toggle, shared by the two pages that list containers so
+/// the same question is asked the same way in both.
+fn running_filter(cx: &Context<'_>, running: usize) -> TableFilter {
+    TableFilter {
+        kind: FilterKind::StoppedContainers,
+        showing_all: cx.show_stopped,
+        narrow_label: format!("Running ({running})"),
+        all_label: format!("All ({})", cx.containers.len()),
+        // Sized to the running ones whichever view is showing, as version 2 decided: the
+        // stopped ones are reached by dragging the divider rather than by opening onto
+        // a table of them.
+        visible_rows: table::visible_rows(running),
     }
 }
 
@@ -293,7 +312,7 @@ fn contents_group(environment: &EnvironmentSummary) -> DetailGroup {
     )
 }
 
-/// The Images node: a summary, then every image as a table.
+/// The Images node: every image as a table, with a summary beneath it.
 #[must_use]
 pub fn images(cx: &Context<'_>) -> DetailPage {
     let images = cx.images;
@@ -324,15 +343,32 @@ pub fn images(cx: &Context<'_>) -> DetailPage {
                 row("Used by containers", in_use.to_string()),
             ],
         )],
-        table: Some(table::images(images, cx.containers, cx.now)),
-        table_first: false,
-        table_filter: None,
+        table: Some(table::images(
+            images,
+            cx.containers,
+            cx.now,
+            cx.show_untagged,
+        )),
+        // The images are what this page is for; the summary is reference material below
+        // them, as on the environment page.
+        table_first: true,
+        table_filter: Some(TableFilter {
+            kind: FilterKind::UntaggedImages,
+            showing_all: cx.show_untagged,
+            narrow_label: format!("Tagged ({})", images.len() - untagged),
+            all_label: format!("All ({})", images.len()),
+            visible_rows: table::visible_rows(if cx.show_untagged {
+                images.len()
+            } else {
+                images.len() - untagged
+            }),
+        }),
         raw: None,
         actions: Vec::new(),
     }
 }
 
-/// The Containers node: a summary broken down by state, then every container as a table.
+/// The Containers node: every container as a table, with a summary beneath it.
 #[must_use]
 pub fn containers(cx: &Context<'_>) -> DetailPage {
     let containers = cx.containers;
@@ -370,12 +406,19 @@ pub fn containers(cx: &Context<'_>) -> DetailPage {
                 row("Other", other.to_string()),
             ],
         )],
-        table: Some(table::containers(containers, cx.now)),
-        table_first: false,
-        table_filter: None,
+        table: Some(table::containers(containers, cx.now, cx.show_stopped)),
+        table_first: true,
+        table_filter: Some(running_filter(cx, count_running(containers))),
         raw: None,
         actions: Vec::new(),
     }
+}
+
+fn count_running(containers: &[ContainerSummary]) -> usize {
+    containers
+        .iter()
+        .filter(|container| container.state.is_active())
+        .count()
 }
 
 /// One image, with its relationships to containers and to other images.
@@ -677,6 +720,7 @@ mod tests {
         layers: LayerIndex,
         raw: Option<serde_json::Value>,
         show_stopped: bool,
+        show_untagged: bool,
     }
 
     impl Default for World {
@@ -688,6 +732,7 @@ mod tests {
                 raw: None,
                 // Matches Settings::default, so tests exercise what a fresh install does.
                 show_stopped: true,
+                show_untagged: true,
             }
         }
     }
@@ -695,6 +740,11 @@ mod tests {
     impl World {
         fn showing_running_only(mut self) -> Self {
             self.show_stopped = false;
+            self
+        }
+
+        fn showing_tagged_only(mut self) -> Self {
+            self.show_untagged = false;
             self
         }
 
@@ -730,6 +780,7 @@ mod tests {
                 now: NOW,
                 offset: utc(),
                 show_stopped: self.show_stopped,
+                show_untagged: self.show_untagged,
             }
         }
     }
@@ -1009,7 +1060,7 @@ mod tests {
             .expect("the filter toggle is offered");
 
         assert!(filter.showing_all);
-        assert_eq!(filter.running_label, "Running (1)");
+        assert_eq!(filter.narrow_label, "Running (1)");
         assert_eq!(filter.all_label, "All (2)");
         // One running container, so the table takes the floor rather than one row.
         assert_eq!(filter.visible_rows, crate::model::table::MIN_VISIBLE_ROWS);
@@ -1037,7 +1088,7 @@ mod tests {
             .table_filter
             .expect("the filter toggle is offered");
 
-        assert_eq!(filter.running_label, "Running (10)");
+        assert_eq!(filter.narrow_label, "Running (10)");
         assert_eq!(filter.all_label, "All (30)");
         assert_eq!(filter.visible_rows, 10, "sized to the running ones only");
     }
@@ -1071,24 +1122,118 @@ mod tests {
     }
 
     #[test]
-    fn only_the_environment_page_carries_a_filter_toggle() {
+    fn a_page_listing_one_object_carries_no_filter_toggle() {
         let world = World::default()
             .with_images(vec![sample_image()])
             .with_containers(vec![sample_container()]);
         let cx = world.context();
 
-        assert!(images(&cx).table_filter.is_none());
-        assert!(containers(&cx).table_filter.is_none());
         assert!(image(&sample_image(), &cx).table_filter.is_none());
+        assert!(container(&sample_container(), &cx).table_filter.is_none());
     }
 
     #[test]
-    fn the_overview_tables_follow_their_summaries_rather_than_leading() {
+    fn every_listing_page_leads_with_its_table() {
+        // The objects are what these pages are for; the summary is reference material
+        // below them, and 300 pixels of it before the first row is not a summary.
         let world = World::default().with_containers(vec![sample_container()]);
         let cx = world.context();
 
-        assert!(!images(&cx).table_first);
-        assert!(!containers(&cx).table_first);
+        assert!(images(&cx).table_first);
+        assert!(containers(&cx).table_first);
+        assert_eq!(images(&cx).group_titles(), vec!["Summary"]);
+        assert_eq!(containers(&cx).group_titles(), vec!["Summary"]);
+    }
+
+    #[test]
+    fn the_containers_page_hides_the_stopped_ones_on_request() {
+        let mut exited = sample_container();
+        exited.id = "exited".to_owned();
+        exited.names = vec!["sleeper".to_owned()];
+        exited.state = ContainerState::Exited;
+        let listing = vec![sample_container(), exited];
+
+        let all = World::default().with_containers(listing.clone());
+        assert_eq!(
+            containers(&all.context()).table.expect("table").rows.len(),
+            2
+        );
+
+        let running = World::default()
+            .with_containers(listing)
+            .showing_running_only();
+        let page = containers(&running.context());
+        let table = page.table.expect("table");
+
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.cell(0, "Container"), Some("web"));
+
+        let filter = page.table_filter.expect("the toggle is still offered");
+        assert!(!filter.showing_all);
+        assert_eq!(filter.kind, FilterKind::StoppedContainers);
+        assert_eq!(filter.narrow_label, "Running (1)");
+        assert_eq!(filter.all_label, "All (2)");
+    }
+
+    #[test]
+    fn the_containers_page_asks_the_same_question_as_the_environment_page() {
+        // One preference drives both, so the toggles cannot disagree about what is showing.
+        let world = World::default()
+            .with_containers(vec![sample_container()])
+            .showing_running_only();
+        let cx = world.context();
+
+        let overview = containers(&cx).table_filter.expect("filter");
+        let environment = environment(&environment_summary(), &resolved(), &cx)
+            .table_filter
+            .expect("filter");
+
+        assert_eq!(overview.kind, environment.kind);
+        assert_eq!(overview.showing_all, environment.showing_all);
+    }
+
+    #[test]
+    fn the_images_page_hides_the_untagged_ones_on_request() {
+        let mut untagged = sample_image();
+        untagged.id = "sha256:loose".to_owned();
+        untagged.repo_tags = Vec::new();
+        let listing = vec![sample_image(), untagged];
+
+        let all = World::default().with_images(listing.clone());
+        assert_eq!(images(&all.context()).table.expect("table").rows.len(), 2);
+
+        let tagged = World::default().with_images(listing).showing_tagged_only();
+        let page = images(&tagged.context());
+        let table = page.table.expect("table");
+
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.cell(0, "Image"), Some("pub-sub-tui:local"));
+
+        let filter = page.table_filter.expect("the toggle is offered");
+        assert!(!filter.showing_all);
+        assert_eq!(filter.kind, FilterKind::UntaggedImages);
+        assert_eq!(filter.narrow_label, "Tagged (1)");
+        assert_eq!(filter.all_label, "All (2)");
+    }
+
+    #[test]
+    fn hiding_the_untagged_images_does_not_change_what_the_summary_counts() {
+        // The summary describes the collection, not the view of it: a count that fell to
+        // zero when the rows were hidden would be reporting the filter back at the user.
+        let mut untagged = sample_image();
+        untagged.id = "sha256:loose".to_owned();
+        untagged.repo_tags = Vec::new();
+        let listing = vec![sample_image(), untagged];
+
+        let page = images(
+            &World::default()
+                .with_images(listing)
+                .showing_tagged_only()
+                .context(),
+        );
+
+        assert_eq!(page.value("Summary", "Images"), Some("2"));
+        assert_eq!(page.value("Summary", "Untagged"), Some("1"));
     }
 
     #[test]

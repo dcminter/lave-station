@@ -18,6 +18,7 @@ const SCHEMA_ID: &str = "com.paperstack.LaveStation";
 
 const SIDEBAR_WIDTH: &str = "sidebar-width";
 const SHOW_STOPPED: &str = "show-stopped-containers";
+const SHOW_UNTAGGED: &str = "show-untagged-images";
 const COLUMN_WIDTHS: &str = "column-widths";
 
 /// Compiled by `build.rs`; present whether or not the schema is installed system-wide.
@@ -59,6 +60,7 @@ impl Prefs {
         Settings {
             sidebar_width: settings.int(SIDEBAR_WIDTH),
             show_stopped_containers: settings.boolean(SHOW_STOPPED),
+            show_untagged_images: settings.boolean(SHOW_UNTAGGED),
             column_widths: read_widths(settings),
         }
         .clamped()
@@ -79,6 +81,10 @@ impl Prefs {
         report(
             SHOW_STOPPED,
             store.set_boolean(SHOW_STOPPED, settings.show_stopped_containers),
+        );
+        report(
+            SHOW_UNTAGGED,
+            store.set_boolean(SHOW_UNTAGGED, settings.show_untagged_images),
         );
         report(
             COLUMN_WIDTHS,
@@ -187,6 +193,7 @@ mod tests {
         let stored = Settings {
             sidebar_width: 421,
             show_stopped_containers: false,
+            show_untagged_images: false,
             column_widths: ColumnWidths::from([
                 (
                     "containers".to_owned(),

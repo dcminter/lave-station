@@ -7,9 +7,22 @@
   color: @window_fg_color;
 }
 
-.tree-detail {
-  color: @window_fg_color;
-  opacity: 0.6;
+/* The context menu is built from buttons rather than from a GMenu, because a
+   GtkModelButton hides its icon whenever the item also has a label. That means its
+   spacing has to be stated here rather than inherited from Adwaita's menu styling. */
+
+.context-menu contents {
+  padding: 6px;
+}
+
+.context-menu button {
+  padding: 6px 10px;
+  min-height: 24px;
+  border-radius: 6px;
+}
+
+.context-menu separator {
+  margin: 4px 2px;
 }
 
 /* Icon tones. State is carried by icon shape and by text as well, so nothing here is

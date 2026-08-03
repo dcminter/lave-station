@@ -136,10 +136,19 @@ fn wide_column(title: &str) -> Column {
 }
 
 /// Every image on the device, in the same order the sidebar lists them.
+///
+/// Without `include_untagged` the residue left behind when a tag moves elsewhere is left
+/// out, which is usually most of what makes the list long.
 #[must_use]
-pub fn images(images: &[ImageSummary], containers: &[ContainerSummary], now: i64) -> Table {
+pub fn images(
+    images: &[ImageSummary],
+    containers: &[ContainerSummary],
+    now: i64,
+    include_untagged: bool,
+) -> Table {
     let rows = sorted_images(images)
         .into_iter()
+        .filter(|image| include_untagged || !super::format::is_untagged(image))
         .map(|image| Row {
             key: NodeId::Image(image.id.clone()),
             icon: "media-optical-symbolic",
@@ -242,11 +251,16 @@ pub fn process_list(containers: &[ContainerSummary], now: i64, include_stopped: 
     }
 }
 
-/// Every container on the device, running or not.
+/// Every container on the device.
+///
+/// `include_stopped` is the same choice the environment page's table offers, and reads
+/// from the same preference: the question "do I care about stopped containers right now"
+/// has one answer, not one per page.
 #[must_use]
-pub fn containers(containers: &[ContainerSummary], now: i64) -> Table {
+pub fn containers(containers: &[ContainerSummary], now: i64, include_stopped: bool) -> Table {
     let rows = sorted_containers(containers)
         .into_iter()
+        .filter(|container| include_stopped || container.state.is_active())
         .map(|container| {
             let ports: Vec<String> = container.ports.iter().map(port).collect();
             Row {
@@ -320,7 +334,7 @@ mod tests {
 
     #[test]
     fn the_images_table_has_the_columns_the_width_is_for() {
-        let table = images(&[], &[], NOW);
+        let table = images(&[], &[], NOW, true);
 
         assert_eq!(
             table.column_titles(),
@@ -334,6 +348,7 @@ mod tests {
             &[image("aaa", "nginx:1.27", 164_231_172, NOW - 172_800)],
             &[],
             NOW,
+            true,
         );
 
         assert_eq!(table.cell(0, "Image"), Some("nginx:1.27"));
@@ -352,6 +367,7 @@ mod tests {
             ],
             &[],
             NOW,
+            true,
         );
 
         let size = |row: usize| table.rows[row].cells[2].sort.clone();
@@ -377,6 +393,7 @@ mod tests {
                 container("db", "other", ContainerState::Running),
             ],
             NOW,
+            true,
         );
 
         assert_eq!(table.cell(0, "Containers"), Some("2"));
@@ -393,6 +410,7 @@ mod tests {
             ],
             &[],
             NOW,
+            true,
         );
 
         let first_column: Vec<&str> = (0..table.rows.len())
@@ -404,7 +422,7 @@ mod tests {
 
     #[test]
     fn every_image_row_points_at_the_node_that_selects_it() {
-        let table = images(&[image("aaa", "nginx:1.27", 1, 1)], &[], NOW);
+        let table = images(&[image("aaa", "nginx:1.27", 1, 1)], &[], NOW, true);
 
         assert_eq!(table.rows[0].key, NodeId::Image("sha256:aaa".to_owned()));
     }
@@ -415,6 +433,7 @@ mod tests {
             &[image("aaa", "", 1, 1), image("bbb", "nginx:1.27", 1, 1)],
             &[],
             NOW,
+            true,
         );
 
         assert_eq!(table.rows[0].tone, Tone::Neutral, "nginx sorts first");
@@ -431,7 +450,7 @@ mod tests {
             protocol: "tcp".to_owned(),
         }];
 
-        let table = containers(&[published], NOW);
+        let table = containers(&[published], NOW, true);
 
         assert_eq!(
             table.column_titles(),
@@ -446,7 +465,11 @@ mod tests {
 
     #[test]
     fn a_container_publishing_nothing_says_none_rather_than_leaving_a_gap() {
-        let table = containers(&[container("web", "aaa", ContainerState::Exited)], NOW);
+        let table = containers(
+            &[container("web", "aaa", ContainerState::Exited)],
+            NOW,
+            true,
+        );
 
         assert_eq!(table.cell(0, "Ports"), Some("none"));
     }
@@ -456,7 +479,7 @@ mod tests {
         let mut anonymous = container("web", "aaa", ContainerState::Running);
         anonymous.image = String::new();
 
-        let table = containers(&[anonymous], NOW);
+        let table = containers(&[anonymous], NOW, true);
 
         assert_eq!(table.cell(0, "Image"), Some("aaa"));
     }
@@ -469,6 +492,7 @@ mod tests {
                 container("beta", "aaa", ContainerState::Exited),
             ],
             NOW,
+            true,
         );
 
         assert_eq!(table.rows[0].tone, Tone::Good);
@@ -610,8 +634,8 @@ mod tests {
     #[test]
     fn every_table_names_itself_so_its_column_widths_can_be_stored() {
         let ids = [
-            images(&[], &[], NOW).id,
-            containers(&[], NOW).id,
+            images(&[], &[], NOW, true).id,
+            containers(&[], NOW, true).id,
             process_list(&[], NOW, true).id,
         ];
 
@@ -626,8 +650,8 @@ mod tests {
     #[test]
     fn every_table_opens_newest_first_on_a_column_it_actually_has() {
         for table in [
-            images(&[], &[], NOW),
-            containers(&[], NOW),
+            images(&[], &[], NOW, true),
+            containers(&[], NOW, true),
             process_list(&[], NOW, true),
         ] {
             let sort = table.default_sort.expect("every table opens sorted");
@@ -643,8 +667,8 @@ mod tests {
 
     #[test]
     fn empty_listings_produce_a_table_with_headings_and_no_rows() {
-        assert!(images(&[], &[], NOW).rows.is_empty());
-        assert!(containers(&[], NOW).rows.is_empty());
-        assert_eq!(containers(&[], NOW).columns.len(), 5);
+        assert!(images(&[], &[], NOW, true).rows.is_empty());
+        assert!(containers(&[], NOW, true).rows.is_empty());
+        assert_eq!(containers(&[], NOW, true).columns.len(), 5);
     }
 }

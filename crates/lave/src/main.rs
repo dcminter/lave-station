@@ -5,6 +5,7 @@ mod background;
 mod detail_pane;
 mod fs_node;
 mod fuse_mount;
+mod group_columns;
 mod indicator_tray;
 mod prefs;
 mod runtime;

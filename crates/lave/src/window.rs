@@ -11,7 +11,7 @@ use async_channel::Sender;
 use gtk::glib;
 use lave_core::activity::ActivityState;
 use lave_core::engine::{ContainerSummary, ImageSummary, LogStream, TAIL_LINES};
-use lave_core::model::action::{Action, BulkOffer, Confirmation, Offer};
+use lave_core::model::action::{Action, BulkOffer, Confirmation, Offer, Tally};
 use lave_core::model::detail;
 use lave_core::model::format;
 use lave_core::model::fs_tree::Node;
@@ -55,8 +55,8 @@ mod imp {
         pub images: gtk::gio::ListStore,
         pub containers: gtk::gio::ListStore,
         pub root_node: TreeNodeObject,
-        pub images_node: TreeNodeObject,
-        pub containers_node: TreeNodeObject,
+        /// The standing nodes, in the order the core lists them.
+        pub top_nodes: Vec<TreeNodeObject>,
     }
 
     #[derive(CompositeTemplate, Default)]
@@ -100,25 +100,29 @@ mod imp {
         /// Output tabs currently open, so re-asking for one focuses it instead of
         /// stacking up a duplicate.
         pub open_tabs: RefCell<HashMap<super::TabKey, adw::TabPage>>,
-        /// The offers the open context menu refers to by position, and the object it
-        /// was opened on. Held because the menu deliberately leaves the selection alone,
-        /// so the selection cannot say what is being acted on.
-        pub menu_offers: RefCell<Vec<lave_core::model::action::Offer>>,
-        pub menu_target: RefCell<Option<NodeId>>,
-        /// The offers the cog's menu refers to by position, rebuilt each time it opens.
-        pub bulk_offers: RefCell<Vec<lave_core::model::action::BulkOffer>>,
         /// Keys of the objects checked for a bulk action. Held here rather than in the
         /// widgets because the pane is rebuilt on every refresh; cleared when the page
         /// changes, since a tick made on one page has no business acting from another.
         pub checked: RefCell<HashSet<String>>,
         /// The bulk-action button of the page currently rendered, if it has a table.
         pub cog: RefCell<Option<gtk::MenuButton>>,
+        /// The select-all control beside it.
+        pub select_all: RefCell<Option<gtk::CheckButton>>,
+        /// The keys of every row on the page currently rendered, so select-all knows what
+        /// it covers without interrogating the widgets.
+        pub page_keys: RefCell<Vec<String>>,
+        /// Set while select-all is being brought into line with the checked set, so that
+        /// does not read as the user having operated it.
+        pub syncing: Cell<bool>,
         /// How each table is sorted, by table id. Session-only, deliberately: the user's
         /// order is not written to the settings store.
         pub sorts: RefCell<HashMap<String, super::SortOrder>>,
         /// The context menu currently on screen, so the next one can replace it rather
         /// than requiring a dismissing click of its own.
-        pub open_menu: RefCell<Option<gtk::PopoverMenu>>,
+        pub open_menu: RefCell<Option<gtk::Popover>>,
+        /// Whether the pointer is over that menu, so a press on the menu itself is not
+        /// mistaken for the press that dismisses it.
+        pub menu_hovered: Cell<bool>,
         /// The open file browser, if any: what it is browsing, where it is, and the
         /// widgets a new listing replaces.
         pub browser: RefCell<Option<super::Browser>>,
@@ -257,15 +261,22 @@ impl LaveWindow {
     fn build_stores() -> imp::Stores {
         let empty = tree::build(None, &[], &[]);
         let root_node = TreeNodeObject::from_node(&empty);
-        let images_node = TreeNodeObject::from_node(&empty.children[0]);
-        let containers_node = TreeNodeObject::from_node(&empty.children[1]);
 
         let root = gtk::gio::ListStore::new::<TreeNodeObject>();
         root.append(&root_node);
 
+        // One object per standing node, in the order the core lists them: which of
+        // Containers and Images comes first is decided there and nowhere else.
+        let top_nodes: Vec<TreeNodeObject> = empty
+            .children
+            .iter()
+            .map(TreeNodeObject::from_node)
+            .collect();
+
         let top = gtk::gio::ListStore::new::<TreeNodeObject>();
-        top.append(&images_node);
-        top.append(&containers_node);
+        for node in &top_nodes {
+            top.append(node);
+        }
 
         imp::Stores {
             root,
@@ -273,8 +284,7 @@ impl LaveWindow {
             images: gtk::gio::ListStore::new::<TreeNodeObject>(),
             containers: gtk::gio::ListStore::new::<TreeNodeObject>(),
             root_node,
-            images_node,
-            containers_node,
+            top_nodes,
         }
     }
 
@@ -312,14 +322,27 @@ impl LaveWindow {
             &snapshot.containers,
         );
 
-        self.update_prune_actions();
+        self.update_prune_actions(&snapshot);
 
         if let Some(stores) = self.imp().stores.get() {
             stores.root_node.apply(&tree);
-            stores.images_node.apply(&tree.children[0]);
-            stores.containers_node.apply(&tree.children[1]);
-            fill(&stores.images, &tree.children[0].children);
-            fill(&stores.containers, &tree.children[1].children);
+
+            // By identity rather than by position, so the sidebar's order can change
+            // without any risk of a node being given another one's contents.
+            for object in &stores.top_nodes {
+                if let Some(id) = NodeId::from_key(&object.key())
+                    && let Some(node) = tree.child(&id)
+                {
+                    object.apply(node);
+                }
+            }
+
+            for (id, store) in [
+                (NodeId::Images, &stores.images),
+                (NodeId::Containers, &stores.containers),
+            ] {
+                fill(store, tree.child(&id).map_or(&[], |node| &node.children));
+            }
         }
 
         self.prune_checks(&snapshot);
@@ -375,12 +398,23 @@ impl LaveWindow {
         }
     }
 
-    /// Close the context menu when a click lands outside it.
+    /// Close the context menu when a press lands anywhere else in the window.
     ///
-    /// A modal popover would do this itself, but modality is what makes moving between
-    /// rows cost an extra click. The gesture runs in the capture phase so it fires
-    /// before the row's own handler: right-clicking a second row closes the first menu
-    /// and then opens the second, in that order.
+    /// The menu does not autohide, so GTK will not do this. Two things make the hand-rolled
+    /// version behave, both of which the version 4 attempt got wrong:
+    ///
+    /// * **The phase.** Capture runs root-first, so this fires *before* the row that was
+    ///   clicked. Right-clicking a second row therefore closes the first menu and then
+    ///   opens the second, in that order, on one press. In the bubble phase the order
+    ///   would reverse and the new menu would be shut the instant it opened.
+    /// * **Telling a press on the menu apart from a press elsewhere.** Version 4 compared
+    ///   coordinates — `compute_bounds` of the popover within the overlay. A popover is a
+    ///   `GtkNative` with a surface of its own, so that is a comparison across surfaces
+    ///   and it only has to be wrong once to dismiss a menu the user was choosing from.
+    ///   Whether the pointer is over the menu is asked of the menu instead, which needs no
+    ///   coordinates at all.
+    ///
+    /// The gesture never claims its sequence, so it cannot swallow the press it saw.
     fn setup_menu_dismissal(&self) {
         let outside = gtk::GestureClick::new();
         outside.set_button(0);
@@ -388,26 +422,8 @@ impl LaveWindow {
         outside.connect_pressed(glib::clone!(
             #[weak(rename_to = window)]
             self,
-            move |_, _, x, y| {
-                let Some(popover) = window.imp().open_menu.borrow().clone() else {
-                    return;
-                };
-                // A press on the menu itself is a choice, not a dismissal.
-                let overlay = window.imp().toasts.clone();
-                let point = gtk::graphene::Point::new(
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        x as f32
-                    },
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        y as f32
-                    },
-                );
-                let inside = popover
-                    .compute_bounds(&overlay)
-                    .is_some_and(|bounds| bounds.contains_point(&point));
-                if !inside {
+            move |_, _, _, _| {
+                if !window.imp().menu_hovered.get() {
                     window.close_context_menu();
                 }
             }
@@ -415,49 +431,24 @@ impl LaveWindow {
         self.imp().toasts.add_controller(outside);
     }
 
-    /// Register the actions the context menu and the primary menu invoke.
+    /// Follow the pointer in and out of the open menu.
+    fn watch_menu_pointer(&self, popover: &gtk::Popover) {
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_enter(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, _, _| window.imp().menu_hovered.set(true)
+        ));
+        motion.connect_leave(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| window.imp().menu_hovered.set(false)
+        ));
+        popover.add_controller(motion);
+    }
+
+    /// Register the actions the primary menu invokes.
     fn setup_actions(&self) {
-        // The menu is rebuilt per object, so items refer to offers by position rather
-        // than by name: the set of actions depends on what state the object is in.
-        let offer = gtk::gio::SimpleAction::new("offer", Some(glib::VariantTy::INT32));
-        offer.connect_activate(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_, parameter| {
-                let Some(index) = parameter.and_then(glib::Variant::get::<i32>) else {
-                    return;
-                };
-                let chosen = usize::try_from(index)
-                    .ok()
-                    .and_then(|index| window.imp().menu_offers.borrow().get(index).cloned());
-                let node = window.imp().menu_target.borrow().clone();
-                window.close_context_menu();
-                if let (Some(chosen), Some(node)) = (chosen, node) {
-                    window.invoke(&node, &chosen);
-                }
-            }
-        ));
-        self.add_action(&offer);
-
-        // The same arrangement for the cog, which acts on everything checked at once.
-        let bulk = gtk::gio::SimpleAction::new("bulk", Some(glib::VariantTy::INT32));
-        bulk.connect_activate(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_, parameter| {
-                let Some(index) = parameter.and_then(glib::Variant::get::<i32>) else {
-                    return;
-                };
-                let chosen = usize::try_from(index)
-                    .ok()
-                    .and_then(|index| window.imp().bulk_offers.borrow().get(index).cloned());
-                if let Some(chosen) = chosen {
-                    window.invoke_bulk(&chosen);
-                }
-            }
-        ));
-        self.add_action(&bulk);
-
         for (name, action) in [
             ("prune-containers", Action::PruneContainers),
             ("prune-images", Action::PruneImages),
@@ -493,13 +484,14 @@ impl LaveWindow {
     }
 
     /// Enable each prune only when it would actually remove something.
-    fn update_prune_actions(&self) {
-        let borrowed = self.imp().snapshot.borrow();
-        let offers = borrowed.as_ref().map(|snapshot| {
-            lave_core::model::action::for_environment(&snapshot.containers, &snapshot.images)
-        });
-        drop(borrowed);
-        let offers = offers.unwrap_or_default();
+    ///
+    /// The snapshot is passed in rather than read from the window: this runs as part of
+    /// applying a new one, and reading the field would ask the *previous* listing what is
+    /// prunable — which on the first listing is nothing at all, leaving both items greyed
+    /// out until a second one happened to arrive.
+    fn update_prune_actions(&self, snapshot: &Snapshot) {
+        let offers =
+            lave_core::model::action::for_environment(&snapshot.containers, &snapshot.images);
 
         for (name, action) in [
             ("prune-containers", Action::PruneContainers),
@@ -515,7 +507,13 @@ impl LaveWindow {
     }
 
     /// Show the actions for `node` at a point within `anchor`.
-    fn show_context_menu(&self, node: &NodeId, anchor: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+    pub(crate) fn show_context_menu(
+        &self,
+        node: &NodeId,
+        anchor: &impl IsA<gtk::Widget>,
+        x: f64,
+        y: f64,
+    ) {
         // The popover hangs from the toast overlay rather than from the widget that was
         // clicked, with the point translated into the overlay's coordinates.
         //
@@ -539,48 +537,57 @@ impl LaveWindow {
         }
 
         let entries: Vec<MenuEntry> = offers.iter().map(MenuEntry::from_offer).collect();
-        let menu = build_menu(&entries, "win.offer");
+        let node = node.clone();
+        let popover = menu_popover(
+            &entries,
+            // The whole point of a row menu: right-clicking a different row moves to it in
+            // one click, which a grab would spend on dismissing this one.
+            Dismissal::Watched,
+            glib::clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |index| {
+                    if let Some(offer) = offers.get(index) {
+                        window.invoke(&node, offer);
+                    }
+                }
+            ),
+        );
 
-        self.imp().menu_offers.replace(offers);
-        self.imp().menu_target.replace(Some(node.clone()));
-
-        // Replaces whatever was already showing, so moving from one row to another is
-        // one click rather than a dismiss followed by an open.
+        // Replaces whatever was already showing rather than stacking a second one on it.
         self.close_context_menu();
 
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
         popover.set_parent(&overlay);
-        popover.set_has_arrow(false);
-        // Not modal: a modal popover takes a grab, and the click that dismisses it is
-        // swallowed by that grab instead of reaching the row underneath. Dismissal is
-        // handled explicitly below and in `setup`.
-        popover.set_autohide(false);
-
-        let dismiss = gtk::EventControllerKey::new();
-        dismiss.connect_key_pressed(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |_, key, _, _| {
-                if key == gtk::gdk::Key::Escape {
-                    window.close_context_menu();
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Proceed
-            }
-        ));
-        popover.add_controller(dismiss);
         // Truncating toward zero is right here: the rectangle only has to name the pixel
         // the pointer was over.
         #[allow(clippy::cast_possible_truncation)]
         let at = gtk::gdk::Rectangle::new(point.x() as i32, point.y() as i32, 1, 1);
         popover.set_pointing_to(Some(&at));
+        self.watch_menu_pointer(&popover);
+        // The press that opened this landed on a row, not on the menu that did not yet
+        // exist; the pointer only counts as over the menu once it has been told so.
+        self.imp().menu_hovered.set(false);
+
+        // Without a grab the popover is not given the keyboard, so it has to ask.
         popover.popup();
-        // Without the grab a modal popover would take, focus has to be asked for, or
-        // the menu could not be driven from the keyboard at all.
         popover.grab_focus();
-        tint_menu(popover.upcast_ref(), &entries);
+
+        popover.connect_closed(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |popover| {
+                // Unparenting from inside the signal would destroy the emitter, and the
+                // menu on record may already be a *later* one: closing this to open the
+                // next fires here after the replacement has been stored.
+                let popover = popover.clone();
+                glib::idle_add_local_once(move || {
+                    if window.imp().open_menu.borrow().as_ref() == Some(&popover) {
+                        window.imp().open_menu.take();
+                    }
+                    retire(&popover);
+                });
+            }
+        ));
 
         self.imp().open_menu.replace(Some(popover));
     }
@@ -596,13 +603,11 @@ impl LaveWindow {
     }
 
     /// Dismiss the context menu, if one is showing.
-    ///
-    /// Unparenting is what stops the popover leaking: it is parented to the overlay and
-    /// would otherwise stay a child of it for the life of the window.
     pub(crate) fn close_context_menu(&self) {
+        self.imp().menu_hovered.set(false);
         if let Some(popover) = self.imp().open_menu.take() {
             popover.popdown();
-            popover.unparent();
+            retire(&popover);
         }
     }
 
@@ -645,7 +650,7 @@ impl LaveWindow {
         };
 
         if changed {
-            self.update_cog();
+            self.update_bulk_controls();
         }
     }
 
@@ -655,7 +660,7 @@ impl LaveWindow {
             return;
         }
         self.imp().checked.borrow_mut().clear();
-        self.update_cog();
+        self.update_bulk_controls();
     }
 
     /// Drop ticks for objects that are no longer there, so a bulk action cannot be
@@ -681,7 +686,7 @@ impl LaveWindow {
         };
 
         if changed {
-            self.update_cog();
+            self.update_bulk_controls();
         }
     }
 
@@ -695,49 +700,107 @@ impl LaveWindow {
             #[weak(rename_to = window)]
             self,
             move |button| {
-                let (menu, entries, offers) = window.bulk_menu();
-                window.imp().bulk_offers.replace(offers);
-                button.set_menu_model(Some(&menu));
-
-                // The popover is built from the model after this returns, so the tinting
-                // has to wait for it.
-                glib::idle_add_local_once(glib::clone!(
-                    #[weak]
-                    button,
-                    move || {
-                        if let Some(popover) = button.popover() {
-                            tint_menu(popover.upcast_ref(), &entries);
+                let offers = window.bulk_offers();
+                let entries: Vec<MenuEntry> = offers.iter().map(MenuEntry::from_bulk).collect();
+                let popover = menu_popover(
+                    &entries,
+                    // Hung off a button, so GTK's own dismissal is what is wanted.
+                    Dismissal::Grab,
+                    glib::clone!(
+                        #[weak]
+                        window,
+                        move |index| {
+                            if let Some(offer) = offers.get(index) {
+                                window.invoke_bulk(offer);
+                            }
                         }
-                    }
-                ));
+                    ),
+                );
+                button.set_popover(Some(&popover));
             }
         ));
 
         self.imp().cog.replace(Some(cog.clone()));
-        self.update_cog();
+        self.update_bulk_controls();
     }
 
-    /// The cog is insensitive until something is checked, as there is then nothing for
-    /// it to act on.
-    fn update_cog(&self) {
-        let any = !self.imp().checked.borrow().is_empty();
+    /// Take charge of a freshly rendered select-all control.
+    fn adopt_select_all(&self, check: &gtk::CheckButton) {
+        check.connect_toggled(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |check| {
+                if !window.imp().syncing.get() {
+                    window.set_all_checked(check.is_active());
+                }
+            }
+        ));
+
+        self.imp().select_all.replace(Some(check.clone()));
+        self.update_bulk_controls();
+    }
+
+    /// Tick or untick every row on the page at once.
+    fn set_all_checked(&self, on: bool) {
+        {
+            let keys = self.imp().page_keys.borrow();
+            let mut checked = self.imp().checked.borrow_mut();
+            for key in keys.iter() {
+                if on {
+                    checked.insert(key.clone());
+                } else {
+                    checked.remove(key);
+                }
+            }
+        }
+
+        self.update_bulk_controls();
+
+        // The ticks live in the window, so the rows have to be rebuilt to redraw theirs —
+        // but not from inside the control's own signal handler, which the rebuild would
+        // destroy while it is still running.
+        glib::idle_add_local_once(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move || window.render_detail()
+        ));
+    }
+
+    /// Bring the cog and the select-all control into line with what is checked.
+    ///
+    /// The cog is insensitive until something is checked, as there is then nothing for it
+    /// to act on; select-all shows the mixed state when only some rows are ticked.
+    fn update_bulk_controls(&self) {
+        let tally = self.tally();
 
         if let Some(cog) = self.imp().cog.borrow().as_ref() {
-            cog.set_sensitive(any);
-            cog.set_tooltip_text(Some(if any {
+            cog.set_sensitive(tally.any());
+            cog.set_tooltip_text(Some(if tally.any() {
                 "Act on the checked rows"
             } else {
                 "Check some rows to act on them"
             }));
         }
+
+        if let Some(check) = self.imp().select_all.borrow().as_ref() {
+            // Setting these emits `toggled`, which would read as the user having clicked.
+            self.imp().syncing.set(true);
+            check.set_sensitive(!tally.is_empty());
+            check.set_inconsistent(tally.is_partial());
+            check.set_active(tally.is_complete());
+            check.set_tooltip_text(Some(tally.select_all_label()));
+            self.imp().syncing.set(false);
+        }
     }
 
-    /// The cog's menu, built from what is checked right now.
-    fn bulk_menu(&self) -> (gtk::gio::Menu, Vec<MenuEntry>, Vec<BulkOffer>) {
-        let offers = self.bulk_offers();
-        let entries: Vec<MenuEntry> = offers.iter().map(MenuEntry::from_bulk).collect();
-        let menu = build_menu(&entries, "win.bulk");
-        (menu, entries, offers)
+    /// How much of the page is checked.
+    fn tally(&self) -> Tally {
+        let keys = self.imp().page_keys.borrow();
+        let checked = self.imp().checked.borrow();
+        Tally::new(
+            keys.len(),
+            keys.iter().filter(|key| checked.contains(*key)).count(),
+        )
     }
 
     /// What may be done to the checked objects. Only those still in the listing count: a
@@ -1461,9 +1524,19 @@ impl LaveWindow {
             .window_title
             .set_subtitle(page.subtitle.as_deref().unwrap_or_default());
 
-        // The cog belongs to the widgets about to be replaced; the window keeps whatever
-        // the new render hands it.
+        // These belong to the widgets about to be replaced; the window keeps whatever the
+        // new render hands it.
         self.imp().cog.replace(None);
+        self.imp().select_all.replace(None);
+
+        // What select-all covers, taken from the page rather than from the widgets, since
+        // the widgets only exist for the rows currently scrolled into view.
+        self.imp().page_keys.replace(
+            page.table
+                .as_ref()
+                .map(|table| table.rows.iter().map(|row| row.key.key()).collect())
+                .unwrap_or_default(),
+        );
 
         let table_id = page.table.as_ref().map_or("", |table| table.id);
         let handlers = self.handlers(table_id);
@@ -1485,7 +1558,7 @@ impl LaveWindow {
 
     /// Give the leading table the height its running containers ask for, unless the user
     /// has already dragged the divider somewhere of their own choosing.
-    fn position_divider(&self, filter: Option<&detail::ContainerFilter>) {
+    fn position_divider(&self, filter: Option<&detail::TableFilter>) {
         let Some(filter) = filter else {
             return;
         };
@@ -1511,13 +1584,17 @@ impl LaveWindow {
                 let window = self.clone();
                 Rc::new(move |target| window.navigate_to(&target))
             },
-            set_show_stopped: {
+            set_filter: {
                 let window = self.clone();
-                Rc::new(move |show| window.set_show_stopped(show))
+                Rc::new(move |kind, show_all| window.set_filter(kind, show_all))
             },
             cog_ready: {
                 let window = self.clone();
                 Rc::new(move |cog| window.adopt_cog(&cog))
+            },
+            select_all_ready: {
+                let window = self.clone();
+                Rc::new(move |check| window.adopt_select_all(&check))
             },
             table: TableHandlers {
                 activate: {
@@ -1688,14 +1765,18 @@ impl LaveWindow {
         detail_pane::TableState { sort, widths }
     }
 
-    /// Toggle between running-only and everything, and remember the choice.
-    fn set_show_stopped(&self, show: bool) {
+    /// Widen or narrow a table's view, and remember the choice.
+    fn set_filter(&self, kind: detail::FilterKind, show_all: bool) {
         {
             let mut settings = self.imp().settings.borrow_mut();
-            if settings.show_stopped_containers == show {
+            let held = match kind {
+                detail::FilterKind::StoppedContainers => &mut settings.show_stopped_containers,
+                detail::FilterKind::UntaggedImages => &mut settings.show_untagged_images,
+            };
+            if *held == show_all {
                 return;
             }
-            settings.show_stopped_containers = show;
+            *held = show_all;
         }
         self.store_settings();
         self.render_detail();
@@ -1801,6 +1882,7 @@ impl LaveWindow {
             now: now_seconds(),
             offset: chrono::Offset::fix(chrono::Local::now().offset()),
             show_stopped: self.imp().settings.borrow().show_stopped_containers,
+            show_untagged: self.imp().settings.borrow().show_untagged_images,
         };
 
         match selected {
@@ -1857,10 +1939,9 @@ fn build_factory() -> gtk::SignalListItemFactory {
         let icon = gtk::Image::new();
         let label = gtk::Label::builder()
             .xalign(0.0)
+            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build();
-        let detail = gtk::Label::builder().xalign(1.0).hexpand(true).build();
-        detail.add_css_class("dim-label");
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -1868,7 +1949,6 @@ fn build_factory() -> gtk::SignalListItemFactory {
             .build();
         content.append(&icon);
         content.append(&label);
-        content.append(&detail);
 
         let expander = gtk::TreeExpander::new();
         expander.set_child(Some(&content));
@@ -1894,6 +1974,9 @@ fn build_factory() -> gtk::SignalListItemFactory {
             else {
                 return;
             };
+            // As in the table: the row's own gesture takes any button, so the press has
+            // to be claimed or it selects as well as opening the menu.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
             window.show_context_menu(&node, &expander, x, y);
         });
         expander.add_controller(secondary);
@@ -1925,20 +2008,13 @@ fn build_factory() -> gtk::SignalListItemFactory {
         let Some(label) = icon.next_sibling().and_downcast::<gtk::Label>() else {
             return;
         };
-        let Some(detail) = label.next_sibling().and_downcast::<gtk::Label>() else {
-            return;
-        };
 
         icon.set_icon_name(Some(&node.icon()));
         crate::table_view::apply_tone_class(&icon, &node.tone());
         label.set_label(&node.label());
-        detail.set_label(&node.detail());
-        // Screen readers get the count or state, not just the name.
-        expander.update_property(&[gtk::accessible::Property::Label(&format!(
-            "{} {}",
-            node.label(),
-            node.detail()
-        ))]);
+        // The row shows the name alone; the count or state is spoken rather than drawn.
+        let spoken = format!("{} {}", node.label(), node.description());
+        expander.update_property(&[gtk::accessible::Property::Label(spoken.trim_end())]);
     });
 
     factory
@@ -1974,79 +2050,135 @@ impl MenuEntry {
     }
 }
 
-/// A menu whose items refer to their offers by position.
+/// How an open menu is closed, which is not a detail: it decides what the next click does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dismissal {
+    /// GTK closes it, by taking a pointer grab. The grab **swallows** the click that
+    /// dismisses the menu rather than letting it reach what it landed on, which is right
+    /// for a menu hung off a button — the click was aimed at getting rid of the menu.
+    Grab,
+    /// The window closes it, from a gesture that watches for a press elsewhere. No grab,
+    /// so the dismissing click still reaches what it landed on: a secondary click on
+    /// another row closes this menu *and* opens that row's, on one click rather than two.
+    Watched,
+}
+
+/// A menu of buttons in a popover, rather than a `GMenu` in a `GtkPopoverMenu`.
 ///
-/// Position rather than name because the set of actions depends on the state of what
-/// was clicked, so there is no fixed list of action names to register.
-fn build_menu(entries: &[MenuEntry], action: &str) -> gtk::gio::Menu {
-    let menu = gtk::gio::Menu::new();
-    let mut section = gtk::gio::Menu::new();
+/// The model route cannot do what this application asks of a menu:
+///
+/// * **Icons.** `GtkPopoverMenu` reads the `icon` attribute, but the `GtkModelButton` it
+///   builds hides its image whenever the item also has a label — deliberately, following
+///   the GNOME guidelines, and not configurable. The icons added in version 4 were never
+///   drawn; the widget tree said `visible=false` on every one of them.
+/// * **Colour.** A `GMenu` is a model and cannot carry a CSS class, so tinting the stop
+///   icon meant walking the built widgets and matching `GtkModelButton` by name, since
+///   the type is private to GTK.
+/// * **The scrollbar.** `GtkPopoverMenu` wraps its items in a `GtkScrolledWindow` for
+///   menus taller than the screen, and that is what appeared down the side of a menu of
+///   six items.
+///
+/// Buttons in a plain box answer all three, and arrow keys still move between them.
+fn menu_popover(
+    entries: &[MenuEntry],
+    dismissal: Dismissal,
+    choose: impl Fn(usize) + 'static,
+) -> gtk::Popover {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+
+    let popover = gtk::Popover::builder()
+        .child(&content)
+        .has_arrow(false)
+        .autohide(dismissal == Dismissal::Grab)
+        .position(gtk::PositionType::Bottom)
+        .build();
+    popover.add_css_class("context-menu");
+
+    if dismissal == Dismissal::Watched {
+        // GTK closes an autohiding popover on Escape; this one has to be told.
+        let dismiss = gtk::EventControllerKey::new();
+        dismiss.connect_key_pressed(glib::clone!(
+            #[weak]
+            popover,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    popover.popdown();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        ));
+        popover.add_controller(dismiss);
+    }
+
+    let choose: Rc<dyn Fn(usize)> = Rc::new(choose);
     let mut previous_destructive = false;
 
     for (index, entry) in entries.iter().enumerate() {
-        // Destructive actions get their own section, so the separator sits between
-        // "Restart" and "Remove" rather than anywhere arbitrary.
-        if entry.destructive && !previous_destructive && section.n_items() > 0 {
-            menu.append_section(None, &section);
-            section = gtk::gio::Menu::new();
+        // Destructive actions are set apart, so the rule sits between "Restart" and
+        // "Remove" rather than anywhere arbitrary.
+        if entry.destructive && !previous_destructive && index > 0 {
+            content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         }
         previous_destructive = entry.destructive;
 
-        let index = i32::try_from(index).unwrap_or(0);
-        let item = gtk::gio::MenuItem::new(Some(&entry.label), Some(&format!("{action}({index})")));
-        item.set_icon(&gtk::gio::ThemedIcon::new(entry.icon));
-        section.append_item(&item);
+        content.append(&menu_button(entry, index, &popover, &choose));
     }
 
-    menu.append_section(None, &section);
-    menu
+    popover
 }
 
-/// Tint the icons of the items that remove or halt something.
-///
-/// `GtkPopoverMenu` builds its own widgets from the model, so there is nothing to style
-/// until it has done so: this walks what it built. The buttons come out in the order the
-/// items were appended, and the count is checked before anything is coloured — a GTK
-/// that laid the menu out differently would leave it plain rather than paint the wrong
-/// row red.
-fn tint_menu(popover: &gtk::Widget, entries: &[MenuEntry]) {
-    let mut buttons = Vec::new();
-    collect_model_buttons(popover, &mut buttons);
-
-    if buttons.len() != entries.len() {
-        tracing::debug!(
-            "menu has {} items but {} buttons; leaving it untinted",
-            entries.len(),
-            buttons.len()
-        );
-        return;
+/// One line of the menu: an icon, tinted when the action removes or halts something, and
+/// the label that actually says what it does.
+fn menu_button(
+    entry: &MenuEntry,
+    index: usize,
+    popover: &gtk::Popover,
+    choose: &Rc<dyn Fn(usize)>,
+) -> gtk::Button {
+    let icon = gtk::Image::from_icon_name(entry.icon);
+    if entry.tone == Tone::Bad {
+        icon.add_css_class(entry.tone.css_class());
     }
 
-    for (button, entry) in buttons.iter().zip(entries) {
-        if entry.tone != Tone::Bad {
-            continue;
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    row.append(&icon);
+    row.append(
+        &gtk::Label::builder()
+            .label(&entry.label)
+            .xalign(0.0)
+            .build(),
+    );
+
+    let button = gtk::Button::builder().child(&row).build();
+    button.add_css_class("flat");
+
+    let choose = Rc::clone(choose);
+    // Weak, or the button would hold the popover that holds the button.
+    button.connect_clicked(glib::clone!(
+        #[weak]
+        popover,
+        move |_| {
+            popover.popdown();
+            choose(index);
         }
-        let mut child = button.first_child();
-        while let Some(node) = child {
-            if let Ok(image) = node.clone().downcast::<gtk::Image>() {
-                image.add_css_class(entry.tone.css_class());
-            }
-            child = node.next_sibling();
-        }
-    }
+    ));
+
+    button
 }
 
-/// `GtkModelButton` is private to GTK, so it is recognised by name.
-fn collect_model_buttons(widget: &gtk::Widget, found: &mut Vec<gtk::Widget>) {
-    if widget.type_().name() == "GtkModelButton" {
-        found.push(widget.clone());
-        return;
-    }
-
-    let mut child = widget.first_child();
-    while let Some(node) = child {
-        collect_model_buttons(&node, found);
-        child = node.next_sibling();
+/// Take a closed popover out of the widget tree. It is parented to the toast overlay and
+/// would otherwise stay a child of it for the life of the window.
+fn retire(popover: &gtk::Popover) {
+    if popover.parent().is_some() {
+        popover.unparent();
     }
 }
 
@@ -2283,4 +2415,122 @@ fn launch_file_manager(window: &LaveWindow, path: &Path) {
             }
         ),
     );
+}
+
+/// Widget-level checks that a display is needed for.
+///
+/// One test function, deliberately: GTK must be used from the thread that initialised it,
+/// and the test harness runs `#[test]` functions on threads of its own.
+#[cfg(all(test, feature = "live-gtk"))]
+mod tests {
+    // expect is fine in tests; a failed assumption should abort the test.
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn entries() -> Vec<MenuEntry> {
+        vec![
+            MenuEntry {
+                label: "Start".to_owned(),
+                icon: "media-playback-start-symbolic",
+                tone: Tone::Neutral,
+                destructive: false,
+            },
+            MenuEntry {
+                label: "View Logs".to_owned(),
+                icon: "text-x-generic-symbolic",
+                tone: Tone::Neutral,
+                destructive: false,
+            },
+            MenuEntry {
+                label: "Remove".to_owned(),
+                icon: "user-trash-symbolic",
+                tone: Tone::Bad,
+                destructive: true,
+            },
+        ]
+    }
+
+    /// The buttons and separators of a built menu, in order.
+    fn rows(popover: &gtk::Popover) -> Vec<gtk::Widget> {
+        let mut found = Vec::new();
+        let content = popover.child().expect("the menu has content");
+        let mut child = content.first_child();
+        while let Some(node) = child {
+            found.push(node.clone());
+            child = node.next_sibling();
+        }
+        found
+    }
+
+    #[test]
+    fn the_context_menu_behaves_as_a_context_menu() {
+        gtk::init().expect(
+            "these tests need a display: run them with one, or without --features live-gtk",
+        );
+
+        // A row's menu must not autohide.
+        //
+        // This is the regression. Autohiding takes a pointer grab, and the grab consumes
+        // the click that dismisses the menu instead of letting it through — so a secondary
+        // click on a second row spends itself closing the first row's menu, and opening the
+        // second one costs another click. Dismissal is `setup_menu_dismissal`'s job
+        // precisely so that the press it watches still reaches the row underneath.
+        let row_menu = menu_popover(&entries(), Dismissal::Watched, |_| {});
+        assert!(
+            !row_menu.is_autohide(),
+            "a row's menu must not grab, or moving to another row's menu costs two clicks"
+        );
+
+        // A menu hung off a button is the opposite case: there is no second button to move
+        // to, and the click that dismisses it was aimed at nothing else.
+        let button_menu = menu_popover(&entries(), Dismissal::Grab, |_| {});
+        assert!(
+            button_menu.is_autohide(),
+            "a button's menu should be dismissed by GTK rather than by hand"
+        );
+
+        // Every item shows its icon. `GtkPopoverMenu` could not: a `GtkModelButton` hides
+        // its image whenever the item also has a label, so version 4's icons never drew.
+        let built = rows(&row_menu);
+        let buttons: Vec<gtk::Button> = built
+            .iter()
+            .filter_map(|row| row.clone().downcast::<gtk::Button>().ok())
+            .collect();
+        assert_eq!(buttons.len(), entries().len(), "one button per offer");
+
+        for (button, entry) in buttons.iter().zip(entries()) {
+            let content = button.child().expect("the button has content");
+            let image = content
+                .first_child()
+                .and_downcast::<gtk::Image>()
+                .expect("the button leads with its icon");
+            // `get_visible` is the widget's own property; `is_visible` also asks its
+            // ancestors, and this menu is not on screen. The property is what a
+            // `GtkModelButton` clears, so the property is what has to be checked.
+            assert!(image.get_visible(), "{}'s icon is hidden", entry.label);
+            assert_eq!(
+                image.icon_name().as_deref(),
+                Some(entry.icon),
+                "{} has the wrong icon",
+                entry.label
+            );
+            assert_eq!(
+                image.has_css_class(Tone::Bad.css_class()),
+                entry.tone == Tone::Bad,
+                "{} is tinted wrongly",
+                entry.label
+            );
+        }
+
+        // Destructive actions are set apart, so the rule falls before Remove rather than
+        // anywhere arbitrary.
+        let separators: Vec<usize> = built
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.is::<gtk::Separator>())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(separators, vec![2], "one rule, immediately before Remove");
+    }
 }

@@ -27,8 +27,11 @@ pub type ColumnWidths = BTreeMap<String, BTreeMap<String, i32>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub sidebar_width: i32,
-    /// Whether the environment page's container table includes stopped containers.
+    /// Whether the container tables include the ones that are not running. One answer for
+    /// both pages that list containers, since it is one question.
     pub show_stopped_containers: bool,
+    /// Whether the image table includes the ones carrying no tag.
+    pub show_untagged_images: bool,
     /// Column widths, keyed by table id and column title. A table or column that no
     /// longer exists is ignored at render time rather than dropped here, so renaming a
     /// column cannot make a stored value invalid.
@@ -42,8 +45,10 @@ impl Default for Settings {
         Self {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             // The rest of the application shows stopped containers, so this does too
-            // until the user says otherwise.
+            // until the user says otherwise. Likewise untagged images: hiding things by
+            // default would leave a new user wondering where they went.
             show_stopped_containers: true,
+            show_untagged_images: true,
             column_widths: ColumnWidths::new(),
         }
     }
