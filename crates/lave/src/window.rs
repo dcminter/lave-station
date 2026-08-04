@@ -17,6 +17,7 @@ use lave_core::model::format;
 use lave_core::model::fs_tree::Node;
 use lave_core::model::logs::{self, LogLine};
 use lave_core::model::table::Table;
+use lave_core::model::tabs;
 use lave_core::model::tree::{self, NodeId, Tone, TreeNode};
 
 use crate::detail_pane;
@@ -33,6 +34,14 @@ const CONFIRM_LIST_HEIGHT: i32 = 220;
 const TABLE_ROW_HEIGHT: i32 = 34;
 /// Column headings, the filter toggle above them, frame border and margins.
 const TABLE_CHROME_HEIGHT: i32 = 116;
+
+/// The tab menu's commands, by action name. The labels are in the template, next to the
+/// order they appear in.
+const TAB_COMMANDS: [(&str, tabs::Scope); 3] = [
+    ("close-tabs-left", tabs::Scope::ToLeft),
+    ("close-tabs-right", tabs::Scope::ToRight),
+    ("close-tabs-all", tabs::Scope::All),
+];
 
 mod imp {
     use std::cell::{Cell, OnceCell, RefCell};
@@ -71,12 +80,6 @@ mod imp {
         #[template_child]
         pub content_stack: TemplateChild<gtk::Stack>,
         #[template_child]
-        pub detail_box: TemplateChild<gtk::Box>,
-        #[template_child]
-        pub detail_paned: TemplateChild<gtk::Paned>,
-        #[template_child]
-        pub lead_box: TemplateChild<gtk::Box>,
-        #[template_child]
         pub tab_view: TemplateChild<adw::TabView>,
         #[template_child]
         pub tab_bar: TemplateChild<adw::TabBar>,
@@ -91,7 +94,24 @@ mod imp {
         pub selection: OnceCell<gtk::SingleSelection>,
         pub commands: OnceCell<Sender<Command>>,
         pub snapshot: RefCell<Option<Snapshot>>,
+        /// The open detail tabs, one per object being looked at. The first is the
+        /// environment's, which is pinned and never closed.
+        pub detail_tabs: RefCell<Vec<super::DetailTab>>,
+        /// The tab whose context menu was last opened, which is what its commands
+        /// measure from. Not cleared when the menu closes: the item is activated after
+        /// that, and it would have nothing left to act on.
+        pub menu_tab: RefCell<Option<adw::TabPage>>,
+        /// Set while the sidebar is being brought into line with a tab that has come
+        /// forward, so that does not read as the user having selected something.
+        pub following: Cell<bool>,
+        /// Set while a new listing is being spliced into the tree, for the same reason:
+        /// the selection model moves as rows come and go, and none of that is a choice.
+        pub settling: Cell<bool>,
+        /// What the sidebar has selected.
         pub selected: RefCell<Option<NodeId>>,
+        /// What the detail tab on screen is currently showing, which is the environment
+        /// whenever its own tab is to the front.
+        pub viewing: RefCell<Option<NodeId>>,
         pub raw: RefCell<HashMap<String, serde_json::Value>>,
         pub last_toast: RefCell<String>,
         /// Open log tabs by container ID, so streamed lines reach the right one when
@@ -197,6 +217,17 @@ glib::wrapper! {
                     gtk::ShortcutManager;
 }
 
+/// One detail tab: what it shows, the tab itself, and the widgets it shows it in.
+///
+/// Cheap to clone — the fields are all reference-counted handles — which keeps the list
+/// of them from being borrowed across a render.
+#[derive(Clone)]
+pub struct DetailTab {
+    pub node: NodeId,
+    pub page: adw::TabPage,
+    pub surface: detail_pane::Surface,
+}
+
 impl LaveWindow {
     #[must_use]
     pub fn new(application: &adw::Application, commands: Sender<Command>) -> Self {
@@ -234,20 +265,6 @@ impl LaveWindow {
             self,
             move |_| window.send(Command::Refresh)
         ));
-
-        // A drag of the table divider sticks until the window closes; a refresh must
-        // not silently undo it.
-        self.imp()
-            .detail_paned
-            .connect_position_notify(glib::clone!(
-                #[weak(rename_to = window)]
-                self,
-                move |paned| {
-                    if !window.imp().positioning.get() {
-                        window.imp().lead_position.set(Some(paned.position()));
-                    }
-                }
-            ));
 
         self.setup_actions();
         self.setup_menu_dismissal();
@@ -324,6 +341,12 @@ impl LaveWindow {
 
         self.update_prune_actions(&snapshot);
 
+        // Splicing the stores below makes the selection model pick a neighbour whenever
+        // the row it was on goes away. That is the model shuffling, not the user
+        // choosing, and acting on it would open a tab for whatever it happened to land
+        // on; `restore_selection` decides where the selection ends up.
+        self.imp().settling.set(true);
+
         if let Some(stores) = self.imp().stores.get() {
             stores.root_node.apply(&tree);
 
@@ -345,9 +368,14 @@ impl LaveWindow {
             }
         }
 
+        self.imp().settling.set(false);
+
         self.prune_checks(&snapshot);
         self.imp().snapshot.replace(Some(snapshot));
+        // In this order: the selection lands somewhere that still exists first, so
+        // closing the tabs of objects that have gone cannot be closing the one on screen.
         self.restore_selection();
+        self.prune_detail_tabs();
         self.imp().content_stack.set_visible_child_name("detail");
         self.render_detail();
     }
@@ -355,7 +383,9 @@ impl LaveWindow {
     /// Raw inspect output for a node, cached so reselecting does not refetch.
     pub fn apply_inspect(&self, id: &NodeId, raw: serde_json::Value) {
         self.imp().raw.borrow_mut().insert(id.key(), raw);
-        if self.selected() == *id {
+        // Only the page on screen: the inspect that arrives for a page already navigated
+        // away from is cached and shown when it is next opened.
+        if self.imp().viewing.borrow().as_ref() == Some(id) {
             self.render_detail();
         }
     }
@@ -447,7 +477,7 @@ impl LaveWindow {
         popover.add_controller(motion);
     }
 
-    /// Register the actions the primary menu invokes.
+    /// Register the actions the primary menu and the tab menu invoke.
     fn setup_actions(&self) {
         for (name, action) in [
             ("prune-containers", Action::PruneContainers),
@@ -461,6 +491,85 @@ impl LaveWindow {
             ));
             self.add_action(&prune);
         }
+
+        for (name, scope) in TAB_COMMANDS {
+            let close = gtk::gio::SimpleAction::new(name, None);
+            close.connect_activate(glib::clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |_, _| window.close_tabs(scope)
+            ));
+            self.add_action(&close);
+        }
+    }
+
+    /// Close a run of tabs, as the tab menu asks.
+    ///
+    /// The pages are gathered before any of them goes, since closing one moves every
+    /// position after it.
+    fn close_tabs(&self, scope: tabs::Scope) {
+        let view = self.imp().tab_view.clone();
+        let (count, pinned) = self.tab_counts();
+
+        let doomed: Vec<adw::TabPage> = tabs::closing(scope, count, self.menu_subject(), pinned)
+            .into_iter()
+            .filter_map(|position| i32::try_from(position).ok())
+            .map(|position| view.nth_page(position))
+            .collect();
+
+        for page in doomed {
+            view.close_page(&page);
+        }
+    }
+
+    /// Grey out a tab command that would close nothing, so the menu says what is possible
+    /// rather than offering three items of which two do nothing.
+    fn update_tab_actions(&self, page: Option<&adw::TabPage>) {
+        if let Some(page) = page {
+            self.imp().menu_tab.replace(Some(page.clone()));
+        }
+
+        let (count, pinned) = self.tab_counts();
+        let subject = self.menu_subject();
+
+        for (name, scope) in TAB_COMMANDS {
+            if let Some(found) = self.lookup_action(name)
+                && let Ok(simple) = found.downcast::<gtk::gio::SimpleAction>()
+            {
+                simple.set_enabled(tabs::is_offered(scope, count, subject, pinned));
+            }
+        }
+    }
+
+    /// How many tabs there are, and how many of those are pinned.
+    fn tab_counts(&self) -> (usize, usize) {
+        let view = &self.imp().tab_view;
+        (
+            usize::try_from(view.n_pages()).unwrap_or(0),
+            usize::try_from(view.n_pinned_pages()).unwrap_or(0),
+        )
+    }
+
+    /// Where the tab these commands are measured from sits: the one the menu was opened
+    /// on, or the one in view.
+    ///
+    /// Found by walking the bar rather than by asking `page_position`, which requires the
+    /// page to still be in the view — and the tab a menu was last opened on need not be.
+    fn menu_subject(&self) -> usize {
+        let view = self.imp().tab_view.clone();
+        let Some(wanted) = self
+            .imp()
+            .menu_tab
+            .borrow()
+            .clone()
+            .or_else(|| view.selected_page())
+        else {
+            return 0;
+        };
+
+        (0..view.n_pages())
+            .position(|position| view.nth_page(position) == wanted)
+            .unwrap_or(0)
     }
 
     /// Offer a prune from the primary menu, with the same preview a button gave.
@@ -865,18 +974,35 @@ impl LaveWindow {
         self.clear_checks();
     }
 
-    /// Bind the tab bar to the view and make the metadata page permanent.
+    /// Build the environment's tab and bind the tab bar to the view.
+    ///
+    /// Every detail tab carries a set of widgets of its own: they are all open at once,
+    /// and a widget has one parent, so there is nothing to share.
     fn setup_tabs(&self) {
         let view = self.imp().tab_view.clone();
         self.imp().tab_bar.set_view(Some(&view));
 
-        // Page zero is the metadata, added by the template. Pinning it removes its close
-        // button: it follows the selection and there is nothing sensible to close it to.
-        if let Some(page) = view.nth_page(0).into() {
-            let page: adw::TabPage = page;
-            page.set_title("Details");
-            view.set_page_pinned(&page, true);
-        }
+        // Pinned: it is where the application starts and there is nothing sensible to
+        // close it to. A pinned tab is drawn as its icon alone, so it carries a tooltip.
+        let surface = self.adopt_surface();
+        let page = view.append_pinned(&surface.paned);
+        page.set_title("Docker");
+        page.set_tooltip("Docker");
+        page.set_icon(Some(&self.node_icon(&NodeId::Root)));
+
+        self.imp().detail_tabs.borrow_mut().push(DetailTab {
+            node: NodeId::Root,
+            page,
+            surface,
+        });
+
+        // Whichever detail tab is brought forward draws itself: only one is on screen,
+        // so only one is worth rendering.
+        view.connect_selected_page_notify(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| window.follow_tab()
+        ));
 
         view.connect_close_page(glib::clone!(
             #[weak(rename_to = window)]
@@ -888,10 +1014,153 @@ impl LaveWindow {
                 glib::Propagation::Proceed
             }
         ));
+
+        // Emitted as a tab's context menu opens, carrying the tab it was opened on, and
+        // again with nothing when it closes. The one moment its commands can be measured.
+        view.connect_setup_menu(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, page| window.update_tab_actions(page)
+        ));
+    }
+
+    /// A fresh set of detail widgets, watching its divider.
+    ///
+    /// A drag of that divider sticks until the window closes; a refresh must not silently
+    /// undo it, and neither must moving to another tab.
+    fn adopt_surface(&self) -> detail_pane::Surface {
+        let surface = detail_pane::Surface::new();
+        surface.paned.connect_position_notify(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |paned| {
+                if !window.imp().positioning.get() {
+                    window.imp().lead_position.set(Some(paned.position()));
+                }
+            }
+        ));
+        surface
+    }
+
+    /// The tab showing `node`, opened if there is not one yet.
+    ///
+    /// Tabs accumulate rather than replacing one another, as the log and file tabs do:
+    /// looking at a second container is not a reason to lose the first one's page. Asking
+    /// for one already open brings it forward instead of stacking a duplicate.
+    fn detail_tab(&self, node: &NodeId) -> adw::TabPage {
+        if let Some(tab) = self.detail_tab_for(node) {
+            return tab.page;
+        }
+
+        let surface = self.adopt_surface();
+        let page = self.imp().tab_view.append(&surface.paned);
+        page.set_live_thumbnail(true);
+
+        self.imp().detail_tabs.borrow_mut().push(DetailTab {
+            node: node.clone(),
+            page: page.clone(),
+            surface,
+        });
+
+        page
+    }
+
+    /// The open detail tab for a node, if there is one.
+    fn detail_tab_for(&self, node: &NodeId) -> Option<DetailTab> {
+        self.imp()
+            .detail_tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.node == *node)
+            .cloned()
+    }
+
+    /// Bring the tab for what the sidebar has selected forward, opening it if need be.
+    fn show_selection(&self) {
+        let view = self.imp().tab_view.clone();
+        let before = view.selected_page();
+
+        let page = self.detail_tab(&self.selected());
+        view.set_selected_page(&page);
+
+        // Bringing a different tab forward renders it through the notify; asking for the
+        // one already showing does not, so that case renders here.
+        if view.selected_page() == before {
+            self.render_detail();
+        }
+    }
+
+    /// Follow the tab that has just come forward: the sidebar moves to whatever it shows,
+    /// so the two never disagree about what is being looked at.
+    fn follow_tab(&self) {
+        let Some(tab) = self.viewed() else {
+            // An output tab, which draws itself and stands for the object its own title
+            // names; moving the sidebar for it would be presumptuous.
+            return;
+        };
+
+        self.imp().following.set(true);
+        self.imp().selected.replace(Some(tab.node.clone()));
+        if !self.select_key(&tab.node.key()) {
+            // The branch it lives in has been collapsed since it was opened.
+            self.expand_all();
+            self.select_key(&tab.node.key());
+        }
+        self.imp().following.set(false);
+
+        self.render_detail();
+    }
+
+    /// Close the tab showing a node, which is what an object leaving the daemon does to
+    /// its page.
+    fn close_detail_tab(&self, node: &NodeId) {
+        if let Some(tab) = self.detail_tab_for(node) {
+            self.imp().tab_view.close_page(&tab.page);
+        }
+    }
+
+    /// Drop the tabs of objects that are no longer there. Their pages have nothing left
+    /// to show and their actions nothing left to act on.
+    fn prune_detail_tabs(&self) {
+        let borrowed = self.imp().snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return;
+        };
+
+        let gone: Vec<NodeId> = self
+            .imp()
+            .detail_tabs
+            .borrow()
+            .iter()
+            .map(|tab| tab.node.clone())
+            .filter(|node| match node {
+                NodeId::Container(id) => !snapshot.containers.iter().any(|object| object.id == *id),
+                NodeId::Image(id) => !snapshot.images.iter().any(|object| object.id == *id),
+                // The standing nodes are always there, whatever they hold.
+                NodeId::Root | NodeId::Images | NodeId::Containers => false,
+            })
+            .collect();
+        drop(borrowed);
+
+        for node in &gone {
+            self.close_detail_tab(node);
+        }
     }
 
     /// Release whatever a closing tab was holding open.
     fn on_tab_closed(&self, page: &adw::TabPage) {
+        // A detail tab holds nothing but its own widgets. Which tab takes its place is
+        // the tab view's decision, and `follow_tab` moves the sidebar to match.
+        let was_detail = {
+            let mut tabs = self.imp().detail_tabs.borrow_mut();
+            let before = tabs.len();
+            tabs.retain(|tab| tab.page != *page);
+            tabs.len() != before
+        };
+        if was_detail {
+            return;
+        }
+
         let mut tabs = self.imp().open_tabs.borrow_mut();
         let Some(key) = tabs
             .iter()
@@ -1467,6 +1736,12 @@ impl LaveWindow {
     }
 
     fn on_selection_changed(&self, selection: &gtk::SingleSelection) {
+        // A refresh is rebuilding the tree; where the selection lands in the meantime
+        // says nothing about what the user is looking at.
+        if self.imp().settling.get() {
+            return;
+        }
+
         let Some(node) = selection
             .selected_item()
             .and_downcast::<gtk::TreeListRow>()
@@ -1480,14 +1755,13 @@ impl LaveWindow {
             return;
         };
 
-        // A refresh re-selects the same object, which notifies because the row's item is
-        // new; only a genuine change of page discards the ticks.
-        let previous = self.imp().selected.replace(Some(id.clone()));
-        if previous.as_ref() != Some(&id) {
-            self.clear_checks();
-        }
+        self.imp().selected.replace(Some(id));
 
-        self.render_detail();
+        // A tab coming forward moves the sidebar to match; opening its own tab again on
+        // the way back would be going round in circles.
+        if !self.imp().following.get() {
+            self.show_selection();
+        }
     }
 
     /// Keep the selection across a refresh, falling back to the root if it is gone.
@@ -1502,27 +1776,53 @@ impl LaveWindow {
         }
     }
 
-    fn render_detail(&self) {
-        let selected = self.selected();
+    /// The detail tab on screen. `None` while an output tab is to the front, which draws
+    /// itself.
+    fn viewed(&self) -> Option<DetailTab> {
+        let showing = self.imp().tab_view.selected_page()?;
+        self.imp()
+            .detail_tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.page == showing)
+            .cloned()
+    }
 
-        // A selected object can vanish between refreshes; fall back to the root.
+    /// Draw whichever detail tab is on screen.
+    fn render_detail(&self) {
+        let Some(DetailTab {
+            node: selected,
+            page: tab,
+            surface,
+        }) = self.viewed()
+        else {
+            return;
+        };
+
+        // Before the first listing there is nothing to draw and nothing is wrong. After
+        // one, a page that cannot be built is an object that has gone, and its tab has
+        // nothing left to show.
         let Some(page) = self.build_page(&selected) else {
-            if selected != NodeId::Root {
-                self.imp().selected.replace(Some(NodeId::Root));
-                self.render_detail();
+            if self.imp().snapshot.borrow().is_some() {
+                self.close_detail_tab(&selected);
             }
             return;
         };
 
-        if let Some(details) = self.imp().tab_view.nth_page(0).into() {
-            let details: adw::TabPage = details;
-            details.set_icon(Some(&self.node_icon(&selected)));
-        }
+        tab.set_title(&page.title);
+        tab.set_tooltip(&page.title);
+        tab.set_icon(Some(&self.node_icon(&selected)));
 
         self.imp().window_title.set_title(&page.title);
         self.imp()
             .window_title
             .set_subtitle(page.subtitle.as_deref().unwrap_or_default());
+
+        // Ticks made on one page have no business acting from another, and moving to
+        // another detail tab is a change of page like any other.
+        if self.imp().viewing.replace(Some(selected.clone())).as_ref() != Some(&selected) {
+            self.clear_checks();
+        }
 
         // These belong to the widgets about to be replaced; the window keeps whatever the
         // new render hands it.
@@ -1538,17 +1838,10 @@ impl LaveWindow {
                 .unwrap_or_default(),
         );
 
-        let table_id = page.table.as_ref().map_or("", |table| table.id);
-        let handlers = self.handlers(table_id);
+        let handlers = self.handlers(&page, &selected);
         let state = self.table_state(page.table.as_ref());
-        detail_pane::render(
-            &self.imp().lead_box,
-            &self.imp().detail_box,
-            &page,
-            &state,
-            &handlers,
-        );
-        self.position_divider(page.table_filter.as_ref());
+        detail_pane::render(&surface, &page, &state, &handlers);
+        self.position_divider(&surface.paned, page.table_filter.as_ref());
 
         let inspected = self.imp().raw.borrow().contains_key(&selected.key());
         if matches!(selected, NodeId::Image(_) | NodeId::Container(_)) && !inspected {
@@ -1558,7 +1851,7 @@ impl LaveWindow {
 
     /// Give the leading table the height its running containers ask for, unless the user
     /// has already dragged the divider somewhere of their own choosing.
-    fn position_divider(&self, filter: Option<&detail::TableFilter>) {
+    fn position_divider(&self, paned: &gtk::Paned, filter: Option<&detail::TableFilter>) {
         let Some(filter) = filter else {
             return;
         };
@@ -1569,17 +1862,28 @@ impl LaveWindow {
         });
 
         self.imp().positioning.set(true);
-        self.imp().detail_paned.set_position(wanted);
+        paned.set_position(wanted);
         self.imp().positioning.set(false);
     }
 
     /// The callbacks the detail pane needs. Rebuilt per render, since the widgets it
-    /// attaches them to are rebuilt too, and scoped to the table on the page: the sort
-    /// and the column widths are stored against it by name.
-    fn handlers(&self, table: &str) -> detail_pane::Handlers {
-        let table = table.to_owned();
+    /// attaches them to are rebuilt too, and scoped to the page: the sort and the column
+    /// widths are stored against its table by name, and the action strip acts on the
+    /// object the page describes.
+    fn handlers(&self, page: &detail::DetailPage, node: &NodeId) -> detail_pane::Handlers {
+        let table = page.table.as_ref().map_or("", |table| table.id).to_owned();
 
         detail_pane::Handlers {
+            act: {
+                let window = self.clone();
+                let node = node.clone();
+                let offers = page.actions.clone();
+                Rc::new(move |index: usize| {
+                    if let Some(offer) = offers.get(index) {
+                        window.invoke(&node, offer);
+                    }
+                })
+            },
             navigate: {
                 let window = self.clone();
                 Rc::new(move |target| window.navigate_to(&target))
@@ -2419,12 +2723,18 @@ fn launch_file_manager(window: &LaveWindow, path: &Path) {
 
 /// Widget-level checks that a display is needed for.
 ///
-/// One test function, deliberately: GTK must be used from the thread that initialised it,
-/// and the test harness runs `#[test]` functions on threads of its own.
+/// One `#[test]` function, deliberately: GTK must be used from the thread that
+/// initialised it, and the test harness runs each `#[test]` on a thread of its own. The
+/// checks themselves are named functions called from it.
 #[cfg(all(test, feature = "live-gtk"))]
 mod tests {
     // expect is fine in tests; a failed assumption should abort the test.
     #![allow(clippy::expect_used)]
+
+    use std::cell::Cell;
+
+    use lave_core::engine::{ContainerState, ContainerSummary};
+    use lave_core::model::relations::LayerIndex;
 
     use super::*;
 
@@ -2464,11 +2774,18 @@ mod tests {
     }
 
     #[test]
-    fn the_context_menu_behaves_as_a_context_menu() {
-        gtk::init().expect(
+    fn the_widget_layer_behaves_as_the_iterations_decided() {
+        adw::init().expect(
             "these tests need a display: run them with one, or without --features live-gtk",
         );
 
+        the_context_menu_behaves_as_a_context_menu();
+        an_object_page_leads_with_its_actions();
+        let window = detail_pages_get_a_tab_each_and_keep_it();
+        the_tab_menu_offers_only_what_it_can_close(&window);
+    }
+
+    fn the_context_menu_behaves_as_a_context_menu() {
         // A row's menu must not autohide.
         //
         // This is the regression. Autohiding takes a pointer grab, and the grab consumes
@@ -2532,5 +2849,211 @@ mod tests {
             .map(|(index, _)| index)
             .collect();
         assert_eq!(separators, vec![2], "one rule, immediately before Remove");
+    }
+
+    /// Handlers that record which action was chosen and do nothing else.
+    fn recording(chosen: &Rc<Cell<Option<usize>>>) -> detail_pane::Handlers {
+        detail_pane::Handlers {
+            navigate: Rc::new(|_| {}),
+            set_filter: Rc::new(|_, _| {}),
+            cog_ready: Rc::new(|_| {}),
+            select_all_ready: Rc::new(|_| {}),
+            act: {
+                let chosen = Rc::clone(chosen);
+                Rc::new(move |index| chosen.set(Some(index)))
+            },
+            table: TableHandlers {
+                activate: Rc::new(|_| {}),
+                sort_changed: Rc::new(|_| {}),
+                context: Rc::new(|_, _, _, _| {}),
+                checked: Rc::new(|_| false),
+                toggle: Rc::new(|_, _| {}),
+                resized: Rc::new(|_, _| {}),
+            },
+        }
+    }
+
+    /// The buttons of an action strip, in order. Each sits in a `GtkFlowBoxChild`.
+    fn strip_buttons(bar: &gtk::FlowBox) -> Vec<gtk::Button> {
+        let mut found = Vec::new();
+        let mut child = bar.first_child();
+        while let Some(node) = child {
+            if let Some(button) = node.first_child().and_downcast::<gtk::Button>() {
+                found.push(button);
+            }
+            child = node.next_sibling();
+        }
+        found
+    }
+
+    fn an_object_page_leads_with_its_actions() {
+        let container = ContainerSummary {
+            id: "abc123".to_owned(),
+            names: vec!["web".to_owned()],
+            state: ContainerState::Running,
+            ..ContainerSummary::default()
+        };
+        let containers = [container.clone()];
+        let layers = LayerIndex::new();
+        let cx = detail::Context {
+            images: &[],
+            containers: &containers,
+            layers: &layers,
+            raw: None,
+            now: 0,
+            offset: chrono::FixedOffset::east_opt(0).expect("UTC is a valid offset"),
+            show_stopped: false,
+            show_untagged: false,
+        };
+
+        let page = detail::container(&container, &cx);
+        assert!(
+            !page.actions.is_empty(),
+            "there is something to do to a running container"
+        );
+
+        let chosen: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let surface = detail_pane::Surface::new();
+        let state = detail_pane::TableState {
+            sort: SortOrder::default(),
+            widths: BTreeMap::new(),
+        };
+        detail_pane::render(&surface, &page, &state, &recording(&chosen));
+
+        // The strip comes first, above the groups: the point of it is not having to go
+        // back to the table to act on what is being looked at.
+        let bar = surface
+            .body
+            .first_child()
+            .and_downcast::<adw::Clamp>()
+            .and_then(|clamp| clamp.child())
+            .and_downcast::<gtk::FlowBox>()
+            .expect("an object's page leads with its action strip");
+
+        let buttons = strip_buttons(&bar);
+        assert_eq!(
+            buttons.len(),
+            page.actions.len(),
+            "one button per offer, the same offers the row menu makes"
+        );
+
+        buttons
+            .first()
+            .expect("the strip has buttons")
+            .emit_clicked();
+        assert_eq!(
+            chosen.get(),
+            Some(0),
+            "a button acts on the offer it was built from"
+        );
+    }
+
+    fn detail_pages_get_a_tab_each_and_keep_it() -> LaveWindow {
+        // Opening a page for a container must take nothing away: not the daemon's page,
+        // which version 5 replaced, and not the previous container's, which the first cut
+        // of version 6 replaced.
+        gtk::gio::resources_register_include!("lave.gresource")
+            .expect("the compiled-in resource bundle should load");
+
+        let app = adw::Application::builder()
+            .application_id("com.paperstack.LaveStation.Tests")
+            .build();
+        app.register(gtk::gio::Cancellable::NONE)
+            .expect("the application registers");
+
+        let (commands, _receiver) = async_channel::unbounded();
+        let window = LaveWindow::new(&app, commands);
+        let view = window.imp().tab_view.clone();
+
+        let environment = window
+            .detail_tab_for(&NodeId::Root)
+            .expect("the environment has a tab of its own")
+            .page;
+        assert_eq!(view.n_pages(), 1);
+        assert!(
+            environment.is_pinned(),
+            "the environment's tab cannot be closed"
+        );
+
+        let first = NodeId::Container("one".to_owned());
+        let second = NodeId::Container("two".to_owned());
+        let one = window.detail_tab(&first);
+        let two = window.detail_tab(&second);
+
+        assert_eq!(view.n_pages(), 3, "a tab each, and the environment's kept");
+        assert_eq!(
+            view.nth_page(0),
+            environment,
+            "the environment stays where it was"
+        );
+        assert_eq!(view.nth_page(1), one);
+        assert_eq!(view.nth_page(2), two);
+        assert_eq!(
+            window.detail_tab(&first),
+            one,
+            "asking again brings the same tab forward rather than stacking another"
+        );
+
+        // An object that leaves the daemon takes its page with it, and only its own.
+        window.close_detail_tab(&first);
+        assert_eq!(view.n_pages(), 2);
+        assert_eq!(view.nth_page(0), environment);
+        assert_eq!(view.nth_page(1), two);
+        assert!(window.detail_tab_for(&first).is_none());
+
+        window
+    }
+
+    /// Whether a tab command is offered right now.
+    fn offered(window: &LaveWindow, name: &str) -> bool {
+        window
+            .lookup_action(name)
+            .expect("the tab commands are registered")
+            .is_enabled()
+    }
+
+    fn the_tab_menu_offers_only_what_it_can_close(window: &LaveWindow) {
+        let view = window.imp().tab_view.clone();
+        window.detail_tab(&NodeId::Container("three".to_owned()));
+        window.detail_tab(&NodeId::Container("four".to_owned()));
+
+        // The leftmost tab that can be closed: only the pinned one is to its left.
+        let leftmost = view.nth_page(view.n_pinned_pages());
+        window.update_tab_actions(Some(&leftmost));
+        assert!(
+            !offered(window, "close-tabs-left"),
+            "the environment's tab is pinned and is not going anywhere"
+        );
+        assert!(offered(window, "close-tabs-right"));
+        assert!(offered(window, "close-tabs-all"));
+
+        let last = view.nth_page(view.n_pages() - 1);
+        window.update_tab_actions(Some(&last));
+        assert!(offered(window, "close-tabs-left"));
+        assert!(
+            !offered(window, "close-tabs-right"),
+            "nothing lies to the right of the last tab"
+        );
+
+        // And the commands close what they name, measured from the tab the menu was
+        // opened on rather than the one in view.
+        window.close_tabs(tabs::Scope::ToLeft);
+        assert_eq!(view.n_pages(), 2, "the pinned tab, and the menu's own");
+        assert_eq!(view.nth_page(1), last);
+
+        window.close_tabs(tabs::Scope::All);
+        assert_eq!(view.n_pages(), 1, "closing them all spares the pinned one");
+        assert!(view.nth_page(0).is_pinned());
+
+        // Opening the menu on the tab that is left offers none of the three, since none
+        // of them would close anything.
+        window.update_tab_actions(Some(&view.nth_page(0)));
+        for (name, scope) in TAB_COMMANDS {
+            assert!(
+                !offered(window, name),
+                "{} has nothing to close",
+                scope.label()
+            );
+        }
     }
 }

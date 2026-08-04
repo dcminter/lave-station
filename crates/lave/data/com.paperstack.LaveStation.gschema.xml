@@ -14,21 +14,23 @@
     </key>
 
     <key name="show-stopped-containers" type="b">
-      <default>true</default>
+      <default>false</default>
       <summary>Include stopped containers in the container tables</summary>
       <description>
-        Corresponds to docker ps -a. With this off, only containers that are actually
-        executing are listed. One setting for both pages that list containers, since it
-        is one question.
+        Corresponds to docker ps -a. Off by default, so the tables open onto the
+        containers actually executing; the toggle above each one says how many there are
+        altogether. One setting for both pages that list containers, since it is one
+        question.
       </description>
     </key>
 
     <key name="show-untagged-images" type="b">
-      <default>true</default>
+      <default>false</default>
       <summary>Include untagged images in the image table</summary>
       <description>
-        Untagged images are usually residue left behind when a tag moved elsewhere. With
-        this off, only images carrying at least one tag are listed.
+        Untagged images are usually residue left behind when a tag moved elsewhere, so
+        the table opens onto the tagged ones. The toggle above it says how many images
+        there are altogether.
       </description>
     </key>
 

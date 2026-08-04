@@ -27,10 +27,21 @@ Options: `--docker-host <URL>` overrides `DOCKER_HOST` and any active Docker con
 `--log-level <level>` sets verbosity, and `--no-indicator` suppresses the panel
 indicator.
 
-View preferences — the sidebar width, the container tables' running-only/all toggle, the
-image table's tagged-only/all toggle and the widths you have dragged table columns to —
-are kept in GSettings under `com.paperstack.LaveStation`. Sort order is deliberately not
-among them: it lasts for the session, and every launch opens newest-first.
+The daemon keeps the first tab to itself, and every object you select opens a tab of its
+own beside it, so looking at a second container does not lose the first one's page. Each
+of those pages leads with buttons for the same operations its row's context menu offers.
+The tabs close individually, and an object that leaves the daemon takes its tab with it.
+Right-clicking a tab offers to close all of them, or all those to its left or right; the
+daemon's own tab is pinned and is never among them.
+
+The container tables open onto the containers that are running, and the image table onto
+the images carrying a tag. Nothing is hidden silently: the toggle above each table counts
+both views — "Running (1) / All (6)" — and switching is one click.
+
+View preferences — the sidebar width, those two toggles and the widths you have dragged
+table columns to — are kept in GSettings under `com.paperstack.LaveStation`. Sort order is
+deliberately not among them: it lasts for the session, and every launch opens
+newest-first.
 
 The running-only choice is one setting shared by the environment page and the Containers
 page, since it is one question; the two toggles cannot disagree about what is showing.

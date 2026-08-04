@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use lave_core::model::action::Offer;
 use lave_core::model::detail::{DetailGroup, DetailPage, FilterKind, TableFilter};
-use lave_core::model::tree::NodeId;
+use lave_core::model::tree::{NodeId, Tone};
 
 use crate::group_columns::GroupColumns;
 use crate::table_view::{self, SortOrder, TableHandlers};
@@ -27,6 +28,70 @@ pub struct Handlers {
     pub cog_ready: Rc<dyn Fn(gtk::MenuButton)>,
     /// Likewise the select-all control, whose own state is a summary of the row ticks.
     pub select_all_ready: Rc<dyn Fn(gtk::CheckButton)>,
+    /// A button in the action strip was pressed, by index into the page's own actions.
+    pub act: Rc<dyn Fn(usize)>,
+}
+
+/// One page's worth of widgets: a draggable table above, and everything else scrolling
+/// below it.
+///
+/// Built here rather than in the window template because there is one per open detail
+/// tab: the pages are all open at once, and a widget has one parent, so there is nothing
+/// to share. Cloning one is cloning three reference-counted handles to the same widgets.
+#[derive(Clone)]
+pub struct Surface {
+    /// What goes in a tab.
+    pub paned: gtk::Paned,
+    /// The upper half, shown only for a page whose table leads.
+    pub lead: gtk::Box,
+    /// The lower half, which scrolls.
+    pub body: gtk::Box,
+}
+
+impl Default for Surface {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Surface {
+    #[must_use]
+    pub fn new() -> Self {
+        let lead = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_top(18)
+            .margin_start(18)
+            .margin_end(18)
+            .margin_bottom(6)
+            .build();
+
+        // Unclamped: tables span the full width, and the groups clamp themselves.
+        let body = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .margin_top(18)
+            .margin_bottom(18)
+            .margin_start(18)
+            .margin_end(18)
+            .build();
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&body)
+            .build();
+
+        let paned = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .resize_start_child(false)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
+            .start_child(&lead)
+            .end_child(&scroller)
+            .build();
+
+        Self { paned, lead, body }
+    }
 }
 
 /// How the table on this page is currently viewed. Neither is part of the page itself:
@@ -37,17 +102,12 @@ pub struct TableState {
     pub widths: BTreeMap<String, i32>,
 }
 
-/// Replace the pane's contents.
+/// Replace a surface's contents.
 ///
-/// `lead` is the draggable upper half, used only by a page whose table comes first;
-/// it is hidden otherwise. `body` scrolls and holds everything else.
-pub fn render(
-    lead: &gtk::Box,
-    body: &gtk::Box,
-    detail: &DetailPage,
-    state: &TableState,
-    handlers: &Handlers,
-) {
+/// The surface's upper half is used only by a page whose table comes first, and is
+/// hidden otherwise; the lower half scrolls and holds everything else.
+pub fn render(surface: &Surface, detail: &DetailPage, state: &TableState, handlers: &Handlers) {
+    let (lead, body) = (&surface.lead, &surface.body);
     table_view::clear(lead);
     table_view::clear(body);
 
@@ -63,6 +123,12 @@ pub fn render(
         && leading
     {
         lead.append(table);
+    }
+
+    // First line of an object's page: what may be done to it, without going back to the
+    // table it was reached from.
+    if detail.shows_action_bar() {
+        body.append(&clamped(&action_bar(&detail.actions, &handlers.act)));
     }
 
     if !detail.groups.is_empty() {
@@ -87,6 +153,49 @@ fn clamped(child: &impl IsA<gtk::Widget>) -> adw::Clamp {
         .tightening_threshold(900)
         .child(child)
         .build()
+}
+
+/// The offers for one object, as a row of buttons that wraps when the pane is too narrow
+/// to hold them all.
+///
+/// A flow box is right here and was wrong for the groups: these are all one line tall, so
+/// giving every child in a line the height of the tallest costs nothing.
+fn action_bar(actions: &[Offer], act: &Rc<dyn Fn(usize)>) -> gtk::FlowBox {
+    let bar = gtk::FlowBox::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(6)
+        .row_spacing(6)
+        .max_children_per_line(u32::try_from(actions.len().max(1)).unwrap_or(1))
+        .build();
+
+    for (index, offer) in actions.iter().enumerate() {
+        bar.append(&action_button(offer, index, act));
+    }
+
+    bar
+}
+
+/// One action: the icon it carries in the context menu, tinted the same way, beside the
+/// label that says what it does.
+fn action_button(offer: &Offer, index: usize, act: &Rc<dyn Fn(usize)>) -> gtk::Button {
+    let icon = gtk::Image::from_icon_name(offer.icon);
+    if offer.tone() == Tone::Bad {
+        icon.add_css_class(offer.tone().css_class());
+    }
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    content.append(&icon);
+    content.append(&gtk::Label::new(Some(&offer.label)));
+
+    let button = gtk::Button::builder().child(&content).build();
+
+    let act = Rc::clone(act);
+    button.connect_clicked(move |_| act(index));
+    button
 }
 
 fn table_section(

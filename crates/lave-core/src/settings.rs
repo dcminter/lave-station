@@ -44,11 +44,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
-            // The rest of the application shows stopped containers, so this does too
-            // until the user says otherwise. Likewise untagged images: hiding things by
-            // default would leave a new user wondering where they went.
-            show_stopped_containers: true,
-            show_untagged_images: true,
+            // Both tables open onto the working set: the containers actually executing,
+            // and the images still named by a tag. Neither hides anything the user
+            // cannot see: the toggle above each table says how many rows the other view
+            // holds, and switching to it is one click.
+            show_stopped_containers: false,
+            show_untagged_images: false,
             column_widths: ColumnWidths::new(),
         }
     }
@@ -126,11 +127,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_defaults_show_everything_at_a_readable_width() {
+    fn the_defaults_open_onto_the_working_set_at_a_readable_width() {
         let settings = Settings::default();
 
         assert_eq!(settings.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
-        assert!(settings.show_stopped_containers);
+        // Running containers and tagged images: what is on the machine now, rather than
+        // that plus everything left behind.
+        assert!(!settings.show_stopped_containers);
+        assert!(!settings.show_untagged_images);
         assert!(settings.column_widths.is_empty());
     }
 

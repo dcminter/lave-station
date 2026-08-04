@@ -39,9 +39,11 @@ mod imp {
         ) -> (i32, i32, i32, i32) {
             if orientation == Orientation::Horizontal {
                 let (minimum, natural) = super::widest(widget);
-                // One column at its narrowest; as many as are allowed at their natural
-                // width, which is what makes the pane open two abreast when it can.
-                let columns = i32::try_from(layout::MAX_COLUMNS).unwrap_or(1);
+                // One column at its narrowest; at its natural width, as many columns as
+                // are allowed — but never more than there are children, so a page of one
+                // group does not ask for room for a second.
+                let wanted = super::children(widget).len().clamp(1, layout::MAX_COLUMNS);
+                let columns = i32::try_from(wanted).unwrap_or(1);
                 let gutters = (columns - 1) * layout::GUTTER;
                 return (minimum, natural * columns + gutters, -1, -1);
             }
@@ -52,10 +54,11 @@ mod imp {
 
         fn allocate(&self, widget: &gtk::Widget, width: i32, _height: i32, _baseline: i32) {
             let (placements, _) = super::plan(widget, width);
-            let columns = layout::column_count(width);
+            let children = super::children(widget);
+            let columns = layout::columns_for(width, children.len());
             let column_width = layout::column_width(width, columns);
 
-            for (child, placement) in super::children(widget).into_iter().zip(placements) {
+            for (child, placement) in children.into_iter().zip(placements) {
                 let column = i32::try_from(placement.column).unwrap_or(0);
                 let height = child.measure(Orientation::Vertical, column_width).1;
                 child.size_allocate(
@@ -160,10 +163,11 @@ fn plan(widget: &gtk::Widget, width: i32) -> (Vec<layout::Placement>, i32) {
     } else {
         width
     };
-    let columns = layout::column_count(width);
+    let children = children(widget);
+    let columns = layout::columns_for(width, children.len());
     let column_width = layout::column_width(width, columns);
 
-    let heights: Vec<i32> = children(widget)
+    let heights: Vec<i32> = children
         .into_iter()
         .map(|child| child.measure(gtk::Orientation::Vertical, column_width).1)
         .collect();

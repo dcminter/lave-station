@@ -99,6 +99,17 @@ impl DetailPage {
             .map(|row| row.value.as_str())
     }
 
+    /// Whether the page leads with a strip of buttons for its actions.
+    ///
+    /// Only the pages describing a single object do. A listing page acts through its
+    /// table — per row from the context menu, or on the checked rows from the cog — and
+    /// the daemon's own prunes are on the primary menu, where a whole-machine action
+    /// belongs.
+    #[must_use]
+    pub fn shows_action_bar(&self) -> bool {
+        self.table.is_none() && !self.actions.is_empty()
+    }
+
     #[must_use]
     pub fn group_titles(&self) -> Vec<&str> {
         self.groups
@@ -1432,6 +1443,29 @@ mod tests {
                 .is_empty()
         );
         assert!(!image(&sample_image(), &world.context()).actions.is_empty());
+    }
+
+    #[test]
+    fn only_an_object_page_leads_with_its_actions_as_buttons() {
+        let stopped = ContainerSummary {
+            id: "old".to_owned(),
+            names: vec!["old".to_owned()],
+            state: ContainerState::Exited,
+            ..ContainerSummary::default()
+        };
+        let world = World::default().with_containers(vec![stopped]);
+        let cx = world.context();
+
+        assert!(container(&sample_container(), &cx).shows_action_bar());
+        assert!(image(&sample_image(), &cx).shows_action_bar());
+
+        // A listing page acts through its table, and the environment's prunes are on the
+        // primary menu, so neither wants a strip of buttons over its table.
+        assert!(!containers(&cx).shows_action_bar());
+        assert!(!images(&cx).shows_action_bar());
+        let overview = environment(&environment_summary(), &resolved(), &cx);
+        assert!(!overview.actions.is_empty(), "there is a prune to be had");
+        assert!(!overview.shows_action_bar());
     }
 
     #[test]

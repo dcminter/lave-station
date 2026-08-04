@@ -10,4 +10,5 @@ pub mod layout;
 pub mod logs;
 pub mod relations;
 pub mod table;
+pub mod tabs;
 pub mod tree;

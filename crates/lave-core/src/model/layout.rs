@@ -36,6 +36,15 @@ pub fn column_count(width: i32) -> usize {
     columns
 }
 
+/// How many columns to use for `groups` of content.
+///
+/// Never more than fit, and never more than there are groups: a page showing one group
+/// gives it the whole width rather than leaving half the pane empty beside it.
+#[must_use]
+pub fn columns_for(width: i32, groups: usize) -> usize {
+    column_count(width).min(groups.max(1))
+}
+
 /// What one column gets of `width`, the gutters having been taken out first.
 #[must_use]
 pub fn column_width(width: i32, columns: usize) -> i32 {
@@ -94,6 +103,26 @@ mod tests {
     fn a_pane_wide_enough_for_two_columns_gets_two() {
         assert_eq!(column_count(2 * MIN_COLUMN_WIDTH + GUTTER), 2);
         assert_eq!(column_count(4000), MAX_COLUMNS);
+    }
+
+    #[test]
+    fn a_lone_group_takes_the_whole_width() {
+        // The Containers and Images pages show one group. Half a wide pane of summary
+        // beside an empty half is worse than a summary the width of the table above it.
+        assert_eq!(columns_for(4000, 1), 1);
+        assert_eq!(column_width(4000, columns_for(4000, 1)), 4000);
+    }
+
+    #[test]
+    fn several_groups_use_as_many_columns_as_fit() {
+        assert_eq!(columns_for(4000, 2), 2);
+        assert_eq!(columns_for(4000, 7), MAX_COLUMNS);
+        assert_eq!(columns_for(500, 7), 1, "a narrow pane still folds");
+    }
+
+    #[test]
+    fn nothing_to_show_still_reports_a_column() {
+        assert_eq!(columns_for(4000, 0), 1);
     }
 
     #[test]
