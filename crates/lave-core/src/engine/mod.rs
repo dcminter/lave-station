@@ -104,6 +104,90 @@ pub struct MountSummary {
     pub read_write: bool,
 }
 
+/// One container's resource use at a moment, as `/containers/{id}/stats` reports it.
+///
+/// Only the memory figures so far: they are what a developer glances at, and they are
+/// the ones a single sample can answer. CPU needs two samples to mean anything.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContainerStats {
+    pub id: String,
+    /// Bytes in use with the page cache taken out, which is the figure `docker stats`
+    /// prints. Negative when the daemon did not report one.
+    pub memory_usage: i64,
+    /// The cgroup limit, or the host's memory when the container is unconstrained.
+    /// Negative when the daemon did not report one.
+    pub memory_limit: i64,
+}
+
+impl ContainerStats {
+    /// Whether the daemon actually reported a usage figure. A container that has just
+    /// stopped answers with an empty sample rather than an error.
+    #[must_use]
+    pub fn has_memory(&self) -> bool {
+        self.memory_usage >= 0
+    }
+
+    /// Usage as a fraction of the limit, or `None` when either is unknown. Left as a
+    /// fraction so the caller decides how to render it.
+    #[must_use]
+    pub fn memory_fraction(&self) -> Option<f64> {
+        if !self.has_memory() || self.memory_limit <= 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the ratio is shown to one decimal place"
+        )]
+        Some(self.memory_usage as f64 / self.memory_limit as f64)
+    }
+}
+
+/// One category's disk footprint, as `/system/df` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiskCategory {
+    pub total_count: i64,
+    pub active_count: i64,
+    /// Bytes actually on disk, deduplicated: a layer shared by two images is counted
+    /// once, which is what makes this smaller than the sum of the listing's sizes.
+    pub size: i64,
+    /// Bytes a prune of this category would give back.
+    pub reclaimable: i64,
+}
+
+/// What the daemon says its storage is spent on.
+///
+/// Each category is `None` when the daemon did not break it down: the itemised form of
+/// `/system/df` arrived in API 1.49, and an older daemon simply leaves it out rather
+/// than failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiskUsage {
+    pub images: Option<DiskCategory>,
+    pub containers: Option<DiskCategory>,
+    pub volumes: Option<DiskCategory>,
+    pub build_cache: Option<DiskCategory>,
+}
+
+impl DiskUsage {
+    /// Everything the daemon did account for, added up. `None` when it accounted for
+    /// nothing, so a page can leave the row out rather than claiming zero.
+    #[must_use]
+    pub fn total_size(&self) -> Option<i64> {
+        self.sum(|category| category.size)
+    }
+
+    /// What a prune of everything would give back, across the categories reported.
+    #[must_use]
+    pub fn total_reclaimable(&self) -> Option<i64> {
+        self.sum(|category| category.reclaimable)
+    }
+
+    fn sum(&self, field: impl Fn(&DiskCategory) -> i64) -> Option<i64> {
+        let categories = [self.images, self.containers, self.volumes, self.build_cache];
+        let reported: Vec<i64> = categories.iter().flatten().map(&field).collect();
+        (!reported.is_empty()).then(|| reported.into_iter().sum())
+    }
+}
+
 /// The startup capability probe of `docs/container_daemon_integration.md` §8.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EnvironmentSummary {
@@ -279,6 +363,15 @@ pub trait ContainerEngine: Send + Sync {
 
     async fn list_containers(&self) -> Result<Vec<ContainerSummary>, EngineError>;
 
+    /// One sample of a container's resource use. A single sample, not a subscription:
+    /// the memory figure is meaningful on its own, and holding a stream open per
+    /// container would cost the daemon a goroutine each.
+    async fn container_stats(&self, id: &str) -> Result<ContainerStats, EngineError>;
+
+    /// What the daemon's storage is spent on. Deduplicated across layers, which is why
+    /// this and not the sum of the image listing is the disk footprint.
+    async fn disk_usage(&self) -> Result<DiskUsage, EngineError>;
+
     /// Raw inspect output, rendered verbatim in the detail pane.
     async fn inspect_image(&self, id: &str) -> Result<serde_json::Value, EngineError>;
 
@@ -344,4 +437,75 @@ pub fn is_scratch(container: &ContainerSummary) -> bool {
 #[must_use]
 pub fn scratch_strays(containers: &[ContainerSummary]) -> Vec<&ContainerSummary> {
     containers.iter().filter(|c| is_scratch(c)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn category(size: i64, reclaimable: i64) -> DiskCategory {
+        DiskCategory {
+            total_count: 1,
+            active_count: 1,
+            size,
+            reclaimable,
+        }
+    }
+
+    #[test]
+    fn a_measured_sample_reports_its_share_of_the_limit() {
+        let stats = ContainerStats {
+            id: "web".to_owned(),
+            memory_usage: 2_000_000_000,
+            memory_limit: 8_000_000_000,
+        };
+
+        assert!(stats.has_memory());
+        assert_eq!(stats.memory_fraction(), Some(0.25));
+    }
+
+    #[test]
+    fn an_unmeasured_sample_has_no_share_to_report() {
+        let unmeasured = ContainerStats {
+            id: "web".to_owned(),
+            memory_usage: -1,
+            memory_limit: -1,
+        };
+        assert!(!unmeasured.has_memory());
+        assert_eq!(unmeasured.memory_fraction(), None);
+
+        // Unconstrained containers on some daemons report usage but no limit.
+        let unlimited = ContainerStats {
+            memory_usage: 2_000,
+            memory_limit: 0,
+            ..unmeasured
+        };
+        assert!(unlimited.has_memory());
+        assert_eq!(unlimited.memory_fraction(), None);
+    }
+
+    #[test]
+    fn disk_usage_adds_up_the_categories_the_daemon_broke_down() {
+        let usage = DiskUsage {
+            images: Some(category(1_000, 400)),
+            containers: Some(category(30, 30)),
+            volumes: None,
+            build_cache: Some(category(500, 500)),
+        };
+
+        assert_eq!(usage.total_size(), Some(1_530));
+        assert_eq!(usage.total_reclaimable(), Some(930));
+    }
+
+    #[test]
+    fn a_daemon_that_broke_nothing_down_yields_no_total_rather_than_zero() {
+        let usage = DiskUsage::default();
+
+        assert_eq!(
+            usage.total_size(),
+            None,
+            "zero would be a claim we cannot make"
+        );
+        assert_eq!(usage.total_reclaimable(), None);
+    }
 }

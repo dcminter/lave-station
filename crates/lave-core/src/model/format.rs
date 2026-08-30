@@ -162,6 +162,42 @@ pub fn text_or_unknown(value: &str) -> String {
     }
 }
 
+/// A fraction as a percentage, to one decimal place. Below a tenth of a percent it
+/// reads as "<0.1%" rather than as a rounded 0.0%, which would look like nothing.
+#[must_use]
+pub fn percent(fraction: f64) -> String {
+    if !fraction.is_finite() || fraction < 0.0 {
+        return "unknown".to_owned();
+    }
+    let value = fraction * 100.0;
+    if value > 0.0 && value < 0.05 {
+        return "<0.1%".to_owned();
+    }
+    format!("{value:.1}%")
+}
+
+/// Bytes used out of a ceiling, as the detail pane phrases it.
+#[must_use]
+pub fn share(used: i64, ceiling: i64) -> String {
+    if used < 0 {
+        return "unknown".to_owned();
+    }
+    if ceiling <= 0 {
+        return bytes(used);
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the share is shown to one decimal place"
+    )]
+    let fraction = used as f64 / ceiling as f64;
+    format!(
+        "{} of {} ({})",
+        bytes(used),
+        bytes(ceiling),
+        percent(fraction)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     // expect is fine in tests; a failed assumption should abort the test.
@@ -354,5 +390,41 @@ mod tests {
         assert_eq!(list_or_none(&["a".to_owned(), "b".to_owned()]), "a, b");
         assert_eq!(text_or_unknown("   "), "unknown");
         assert_eq!(text_or_unknown("overlayfs"), "overlayfs");
+    }
+
+    #[test]
+    fn a_percentage_is_shown_to_one_decimal_place() {
+        assert_eq!(percent(0.0), "0.0%");
+        assert_eq!(percent(0.253_4), "25.3%");
+        assert_eq!(percent(1.0), "100.0%");
+    }
+
+    #[test]
+    fn a_share_too_small_to_round_says_so_rather_than_reading_as_nothing() {
+        // 2 MB of a 64 GB host really is a rounding error, but it is not zero.
+        assert_eq!(percent(0.000_03), "<0.1%");
+        assert_eq!(percent(0.001), "0.1%");
+    }
+
+    #[test]
+    fn a_percentage_that_is_not_a_number_is_not_rendered_as_one() {
+        assert_eq!(percent(f64::NAN), "unknown");
+        assert_eq!(percent(-0.5), "unknown");
+    }
+
+    #[test]
+    fn a_share_names_both_figures_and_what_they_come_to() {
+        assert_eq!(share(2_000_000, 8_000_000_000), "2.0 MB of 8.0 GB (<0.1%)");
+        assert_eq!(
+            share(4_000_000_000, 8_000_000_000),
+            "4.0 GB of 8.0 GB (50.0%)"
+        );
+    }
+
+    #[test]
+    fn a_share_with_no_ceiling_is_just_the_figure() {
+        // An unconstrained container on a daemon that did not report the host's memory.
+        assert_eq!(share(2_000_000, 0), "2.0 MB");
+        assert_eq!(share(-1, 8_000_000_000), "unknown");
     }
 }

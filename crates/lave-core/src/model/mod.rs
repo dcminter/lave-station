@@ -8,6 +8,7 @@ pub mod format;
 pub mod fs_tree;
 pub mod layout;
 pub mod logs;
+pub mod metrics;
 pub mod relations;
 pub mod table;
 pub mod tabs;

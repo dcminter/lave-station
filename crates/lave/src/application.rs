@@ -74,6 +74,7 @@ fn consume_updates(application: &adw::Application, window: &LaveWindow, updates:
                 match update {
                     Update::Snapshot(snapshot) => window.apply_snapshot(*snapshot),
                     Update::Inspected { id, raw } => window.apply_inspect(&id, *raw),
+                    Update::Stats(stats) => window.apply_stats(stats),
                     Update::Status(status) => window.apply_status(&status),
                     Update::ActionOutcome { message, failed } => {
                         window.apply_action_outcome(&message, failed);

@@ -24,6 +24,7 @@ use crate::detail_pane;
 use crate::runtime::{ActionRequest, BrowseTarget, Command, Snapshot, StatusView, now_seconds};
 use crate::table_view::{SortOrder, TableHandlers};
 use crate::tree_node::TreeNodeObject;
+use lave_core::model::metrics::StatsIndex;
 
 /// A confirmation lists what it will remove, scrolling past this height rather than
 /// growing the dialog off the screen.
@@ -52,6 +53,7 @@ mod imp {
     use gtk::glib::Propagation;
     use gtk::prelude::WidgetExt;
     use gtk::{CompositeTemplate, glib};
+    use lave_core::model::detail::DetailPage;
     use lave_core::model::tree::NodeId;
 
     use crate::runtime::{Command, Snapshot};
@@ -112,6 +114,9 @@ mod imp {
         /// What the detail tab on screen is currently showing, which is the environment
         /// whenever its own tab is to the front.
         pub viewing: RefCell<Option<NodeId>>,
+        /// The page last drawn, and the surface it went into, so a refresh that changes
+        /// nothing a person can see does not rebuild the pane under them.
+        pub rendered: RefCell<Option<(gtk::Paned, DetailPage)>>,
         pub raw: RefCell<HashMap<String, serde_json::Value>>,
         pub last_toast: RefCell<String>,
         /// Open log tabs by container ID, so streamed lines reach the right one when
@@ -377,6 +382,21 @@ impl LaveWindow {
         self.restore_selection();
         self.prune_detail_tabs();
         self.imp().content_stack.set_visible_child_name("detail");
+        self.render_detail();
+    }
+
+    /// Fresh memory samples for a snapshot that is otherwise unchanged.
+    ///
+    /// Only the page on screen is redrawn: the tree, the tabs and the checked rows all
+    /// describe what exists, and none of that has moved.
+    pub fn apply_stats(&self, stats: StatsIndex) {
+        let mut borrowed = self.imp().snapshot.borrow_mut();
+        let Some(snapshot) = borrowed.as_mut() else {
+            return;
+        };
+        snapshot.stats = stats;
+        drop(borrowed);
+
         self.render_detail();
     }
 
@@ -1809,6 +1829,24 @@ impl LaveWindow {
             return;
         };
 
+        // The stats timer redraws on a schedule of its own, and most of its ticks change
+        // nothing a person can see. Rebuilding the pane under one of those would cost the
+        // user their scroll position for no gain, so an identical page is left alone.
+        // Keyed by the surface as well as the page: a tab just opened has an empty one,
+        // whatever it is about to be given.
+        let unchanged = self
+            .imp()
+            .rendered
+            .borrow()
+            .as_ref()
+            .is_some_and(|(into, before)| *into == surface.paned && *before == page);
+        if unchanged {
+            return;
+        }
+        self.imp()
+            .rendered
+            .replace(Some((surface.paned.clone(), page.clone())));
+
         tab.set_title(&page.title);
         tab.set_tooltip(&page.title);
         tab.set_icon(Some(&self.node_icon(&selected)));
@@ -2182,6 +2220,8 @@ impl LaveWindow {
             images: &snapshot.images,
             containers: &snapshot.containers,
             layers: &snapshot.layers,
+            stats: &snapshot.stats,
+            disk: &snapshot.disk,
             raw: raw_cache.get(&selected.key()),
             now: now_seconds(),
             offset: chrono::Offset::fix(chrono::Local::now().offset()),
@@ -2783,6 +2823,7 @@ mod tests {
         an_object_page_leads_with_its_actions();
         let window = detail_pages_get_a_tab_each_and_keep_it();
         the_tab_menu_offers_only_what_it_can_close(&window);
+        a_sample_that_says_nothing_new_does_not_rebuild_the_pane(&window);
     }
 
     fn the_context_menu_behaves_as_a_context_menu() {
@@ -2895,10 +2936,14 @@ mod tests {
         };
         let containers = [container.clone()];
         let layers = LayerIndex::new();
+        let samples = StatsIndex::new();
+        let disk = lave_core::engine::DiskUsage::default();
         let cx = detail::Context {
             images: &[],
             containers: &containers,
             layers: &layers,
+            stats: &samples,
+            disk: &disk,
             raw: None,
             now: 0,
             offset: chrono::FixedOffset::east_opt(0).expect("UTC is a valid offset"),
@@ -3055,5 +3100,79 @@ mod tests {
                 scope.label()
             );
         }
+    }
+
+    /// A snapshot of one running container, with whatever memory figure is given.
+    fn snapshot_holding(usage: i64) -> Snapshot {
+        let container = ContainerSummary {
+            id: "held".to_owned(),
+            names: vec!["held".to_owned()],
+            image: "nginx:1.27".to_owned(),
+            state: ContainerState::Running,
+            ..ContainerSummary::default()
+        };
+
+        let mut stats = StatsIndex::new();
+        stats.insert(lave_core::engine::ContainerStats {
+            id: "held".to_owned(),
+            memory_usage: usage,
+            memory_limit: 8_000_000_000,
+        });
+
+        Snapshot {
+            resolved: lave_core::endpoint::Resolved {
+                endpoint: lave_core::endpoint::Endpoint::Unix("/var/run/docker.sock".into()),
+                source: lave_core::endpoint::EndpointSource::RootfulSocket,
+            },
+            environment: lave_core::engine::EnvironmentSummary::default(),
+            images: Vec::new(),
+            containers: vec![container],
+            layers: LayerIndex::new(),
+            stats,
+            disk: lave_core::engine::DiskUsage::default(),
+        }
+    }
+
+    /// Samples arrive every few seconds whether or not they say anything new, and the
+    /// pane they redraw is the one the user is reading. One that changes nothing must
+    /// leave the widgets — and so the scroll position — exactly where they were.
+    fn a_sample_that_says_nothing_new_does_not_rebuild_the_pane(window: &LaveWindow) {
+        window.apply_snapshot(snapshot_holding(1_000_000));
+        let held = NodeId::Container("held".to_owned());
+        let tab = window.detail_tab(&held);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.render_detail();
+
+        let surface = window
+            .detail_tab_for(&held)
+            .expect("the container has a tab")
+            .surface;
+        let before = surface.body.first_child().expect("the page was drawn");
+
+        let mut same = StatsIndex::new();
+        same.insert(lave_core::engine::ContainerStats {
+            id: "held".to_owned(),
+            memory_usage: 1_000_000,
+            memory_limit: 8_000_000_000,
+        });
+        window.apply_stats(same);
+        assert_eq!(
+            surface.body.first_child().as_ref(),
+            Some(&before),
+            "an identical page must not be rebuilt"
+        );
+
+        let mut moved = StatsIndex::new();
+        moved.insert(lave_core::engine::ContainerStats {
+            id: "held".to_owned(),
+            memory_usage: 900_000_000,
+            memory_limit: 8_000_000_000,
+        });
+        window.apply_stats(moved);
+        assert_ne!(
+            surface.body.first_child().as_ref(),
+            Some(&before),
+            "a figure that has moved must reach the screen"
+        );
     }
 }

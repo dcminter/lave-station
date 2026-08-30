@@ -4,13 +4,16 @@
 //! the GTK layer only turns rows into `AdwActionRow`s.
 
 use crate::endpoint::Resolved;
-use crate::engine::{ContainerState, ContainerSummary, EnvironmentSummary, ImageSummary};
+use crate::engine::{
+    ContainerState, ContainerSummary, DiskCategory, DiskUsage, EnvironmentSummary, ImageSummary,
+};
 
 use super::action::{self, Offer};
 use super::format::{
-    bytes, container_label, image_label, instant, is_untagged, list_or_none, port, short_id,
+    bytes, container_label, image_label, instant, is_untagged, list_or_none, port, share, short_id,
     text_or_unknown,
 };
+use super::metrics::StatsIndex;
 use super::relations::{self, LayerIndex};
 use super::table::{self, Table};
 use super::tree::NodeId;
@@ -76,6 +79,11 @@ pub struct Context<'a> {
     pub images: &'a [ImageSummary],
     pub containers: &'a [ContainerSummary],
     pub layers: &'a LayerIndex,
+    /// The most recent memory sample per container. Refreshed on its own timer, so it
+    /// moves between listings rather than with them.
+    pub stats: &'a StatsIndex,
+    /// What the daemon says its storage is spent on.
+    pub disk: &'a DiskUsage,
     pub raw: Option<&'a serde_json::Value>,
     /// Seconds since the Unix epoch, injected so rendering is deterministic.
     pub now: i64,
@@ -176,6 +184,7 @@ pub fn environment(
         host_group(environment),
         runtime_group(environment),
         contents_group(environment),
+        footprint_group(cx, Some(environment.memory_total)),
     ];
 
     if !environment.security_options.is_empty() {
@@ -323,6 +332,86 @@ fn contents_group(environment: &EnvironmentSummary) -> DetailGroup {
     )
 }
 
+/// What the daemon is costing the machine: memory now, disk since it was installed.
+///
+/// The disk rows come from the daemon's own accounting rather than from the listings,
+/// because a layer shared by two images is one copy on disk and the listings cannot
+/// know that. They are left out entirely on a daemon too old to itemise.
+fn footprint_group(cx: &Context<'_>, host_memory: Option<i64>) -> DetailGroup {
+    let mut rows = vec![row(
+        "Memory in use",
+        memory_in_use(cx.containers, cx.stats, host_memory),
+    )];
+
+    if cx.disk.total_size().is_some() {
+        rows.push(disk_row("Images", cx.disk.images));
+        rows.push(disk_row("Containers", cx.disk.containers));
+        rows.push(disk_row("Volumes", cx.disk.volumes));
+        rows.push(disk_row("Build cache", cx.disk.build_cache));
+        if let Some(total) = cx.disk.total_size() {
+            rows.push(row("Total on disk", bytes(total)));
+        }
+    }
+
+    group("Footprint", rows)
+}
+
+/// One category's disk row: its size, and what a prune of it would give back.
+fn disk_row(label: &str, category: Option<DiskCategory>) -> DetailRow {
+    let Some(category) = category else {
+        return row(label, "unknown");
+    };
+
+    if category.reclaimable > 0 {
+        row(
+            label,
+            format!(
+                "{} ({} reclaimable)",
+                bytes(category.size),
+                bytes(category.reclaimable)
+            ),
+        )
+    } else {
+        row(label, bytes(category.size))
+    }
+}
+
+/// Memory across the containers that are executing, as the summaries phrase it.
+///
+/// The count of containers is part of the figure: a total that silently left one out
+/// would read as the machine's, and it would be wrong.
+fn memory_in_use(
+    containers: &[ContainerSummary],
+    stats: &StatsIndex,
+    host_memory: Option<i64>,
+) -> String {
+    let total = stats.running_total(containers);
+
+    if total.is_empty() {
+        return if total.is_partial() {
+            "not measured yet".to_owned()
+        } else {
+            "nothing running".to_owned()
+        };
+    }
+
+    let held = match host_memory.filter(|memory| *memory > 0) {
+        Some(memory) => share(total.bytes, memory),
+        None => bytes(total.bytes),
+    };
+
+    let across = if total.measured == 1 {
+        format!("{held} in 1 container")
+    } else {
+        format!("{held} across {} containers", total.measured)
+    };
+
+    if total.is_partial() {
+        format!("{across}, {} not measured", total.unmeasured)
+    } else {
+        across
+    }
+}
 /// The Images node: every image as a table, with a summary beneath it.
 #[must_use]
 pub fn images(cx: &Context<'_>) -> DetailPage {
@@ -340,20 +429,27 @@ pub fn images(cx: &Context<'_>) -> DetailPage {
         |image| format!("{} ({})", image_label(image), bytes(image.size)),
     );
 
+    let mut summary = vec![
+        row("Images", images.len().to_string()),
+        // Layers are shared, so this is an upper bound rather than what is on disk.
+        row("Combined size", bytes(total_size)),
+    ];
+
+    // The daemon's own figure, which counts a shared layer once. Absent on a daemon too
+    // old to itemise `/system/df`, in which case the upper bound above is all there is.
+    if let Some(disk) = cx.disk.images {
+        summary.push(row("On disk", bytes(disk.size)));
+        summary.push(row("Reclaimable", bytes(disk.reclaimable)));
+    }
+
+    summary.push(row("Largest", largest));
+    summary.push(row("Untagged", untagged.to_string()));
+    summary.push(row("Used by containers", in_use.to_string()));
+
     DetailPage {
         title: "Images".to_owned(),
         subtitle: Some("Images available on the local device".to_owned()),
-        groups: vec![group(
-            "Summary",
-            vec![
-                row("Images", images.len().to_string()),
-                // Layers are shared, so this is an upper bound rather than disk usage.
-                row("Combined size", bytes(total_size)),
-                row("Largest", largest),
-                row("Untagged", untagged.to_string()),
-                row("Used by containers", in_use.to_string()),
-            ],
-        )],
+        groups: vec![group("Summary", summary)],
         table: Some(table::images(
             images,
             cx.containers,
@@ -415,9 +511,16 @@ pub fn containers(cx: &Context<'_>) -> DetailPage {
                 row("Exited", count(&ContainerState::Exited)),
                 row("Created", count(&ContainerState::Created)),
                 row("Other", other.to_string()),
+                // The host's own total is not on this page, so the figure stands alone.
+                row("Memory in use", memory_in_use(containers, cx.stats, None)),
             ],
         )],
-        table: Some(table::containers(containers, cx.now, cx.show_stopped)),
+        table: Some(table::containers(
+            containers,
+            cx.stats,
+            cx.now,
+            cx.show_stopped,
+        )),
         table_first: true,
         table_filter: Some(running_filter(cx, count_running(containers))),
         raw: None,
@@ -581,6 +684,9 @@ pub fn container(container: &ContainerSummary, cx: &Context<'_>) -> DetailPage {
         group("Storage", vec![row("Mounts", list_or_none(&mounts))]),
     ];
 
+    if let Some(memory) = memory_group(container, cx) {
+        groups.push(memory);
+    }
     if let Some(siblings) = siblings_group(container, cx) {
         groups.push(siblings);
     }
@@ -602,6 +708,32 @@ pub fn container(container: &ContainerSummary, cx: &Context<'_>) -> DetailPage {
         raw: raw_json(cx.raw),
         actions: action::for_container(container, cx.images),
     }
+}
+
+/// What this container is holding, for one that is executing.
+///
+/// Nothing for a stopped container: it holds nothing, and a row saying so on every
+/// stopped page would be noise. A running one that has not been sampled yet says so,
+/// rather than silently dropping the group the user has learned to look for.
+fn memory_group(container: &ContainerSummary, cx: &Context<'_>) -> Option<DetailGroup> {
+    if !container.state.is_active() {
+        return None;
+    }
+
+    let Some(stats) = cx
+        .stats
+        .get(&container.id)
+        .filter(|stats| stats.has_memory())
+    else {
+        return Some(group("Memory", vec![row("In use", "not measured yet")]));
+    };
+
+    // The limit is the host's own memory when the container is unconstrained, which is
+    // how `docker stats` reports it too.
+    Some(group(
+        "Memory",
+        vec![row("In use", share(stats.memory_usage, stats.memory_limit))],
+    ))
 }
 
 /// The image a container runs, and — when they have diverged — the different image its
@@ -729,6 +861,8 @@ mod tests {
         images: Vec<ImageSummary>,
         containers: Vec<ContainerSummary>,
         layers: LayerIndex,
+        stats: StatsIndex,
+        disk: DiskUsage,
         raw: Option<serde_json::Value>,
         show_stopped: bool,
         show_untagged: bool,
@@ -740,6 +874,8 @@ mod tests {
                 images: Vec::new(),
                 containers: Vec::new(),
                 layers: LayerIndex::new(),
+                stats: StatsIndex::new(),
+                disk: DiskUsage::default(),
                 raw: None,
                 // Matches Settings::default, so tests exercise what a fresh install does.
                 show_stopped: true,
@@ -777,6 +913,20 @@ mod tests {
             self
         }
 
+        fn with_stats(mut self, id: &str, usage: i64) -> Self {
+            self.stats.insert(crate::engine::ContainerStats {
+                id: id.to_owned(),
+                memory_usage: usage,
+                memory_limit: 8_000_000_000,
+            });
+            self
+        }
+
+        fn with_disk(mut self, disk: DiskUsage) -> Self {
+            self.disk = disk;
+            self
+        }
+
         fn with_raw(mut self, raw: serde_json::Value) -> Self {
             self.raw = Some(raw);
             self
@@ -787,6 +937,8 @@ mod tests {
                 images: &self.images,
                 containers: &self.containers,
                 layers: &self.layers,
+                stats: &self.stats,
+                disk: &self.disk,
                 raw: self.raw.as_ref(),
                 now: NOW,
                 offset: utc(),
@@ -1677,5 +1829,165 @@ mod tests {
         assert!(image(&sample_image(), &world.context()).raw.is_none());
         assert!(images(&world.context()).raw.is_none());
         assert!(containers(&world.context()).raw.is_none());
+    }
+
+    fn disk_usage() -> DiskUsage {
+        DiskUsage {
+            images: Some(DiskCategory {
+                total_count: 16,
+                active_count: 4,
+                size: 14_783_927_715,
+                reclaimable: 12_556_632_188,
+            }),
+            containers: Some(DiskCategory {
+                total_count: 6,
+                active_count: 1,
+                size: 17_522_688,
+                reclaimable: 17_518_592,
+            }),
+            volumes: Some(DiskCategory::default()),
+            build_cache: Some(DiskCategory {
+                total_count: 103,
+                active_count: 0,
+                size: 8_023_805_715,
+                reclaimable: 7_704_593_624,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_environment_page_reports_what_the_daemon_is_costing_the_machine() {
+        let world = World::default()
+            .with_containers(vec![
+                named_container("web", "nginx:1.27", "abc"),
+                named_container("api", "nginx:1.27", "abc"),
+            ])
+            .with_stats("id-web", 700_000_000)
+            .with_stats("id-api", 300_000_000)
+            .with_disk(disk_usage());
+
+        let page = environment(&environment_summary(), &resolved(), &world.context());
+
+        assert_eq!(
+            page.value("Footprint", "Memory in use"),
+            Some("1.0 GB of 65.0 GB (1.5%) across 2 containers")
+        );
+        assert_eq!(
+            page.value("Footprint", "Images"),
+            Some("14.8 GB (12.6 GB reclaimable)")
+        );
+        assert_eq!(
+            page.value("Footprint", "Volumes"),
+            Some("0 B"),
+            "a category with nothing to reclaim says only its size"
+        );
+        assert_eq!(page.value("Footprint", "Total on disk"), Some("22.8 GB"));
+    }
+
+    #[test]
+    fn a_running_container_that_has_not_been_sampled_makes_the_total_a_floor() {
+        let world = World::default()
+            .with_containers(vec![
+                named_container("web", "nginx:1.27", "abc"),
+                named_container("api", "nginx:1.27", "abc"),
+            ])
+            .with_stats("id-web", 700_000_000);
+
+        let page = containers(&world.context());
+
+        assert_eq!(
+            page.value("Summary", "Memory in use"),
+            Some("700.0 MB in 1 container, 1 not measured")
+        );
+    }
+
+    #[test]
+    fn a_machine_with_nothing_running_says_so_rather_than_reporting_no_memory() {
+        let mut stopped = sample_container();
+        stopped.state = ContainerState::Exited;
+        let world = World::default().with_containers(vec![stopped]);
+
+        let page = containers(&world.context());
+
+        assert_eq!(
+            page.value("Summary", "Memory in use"),
+            Some("nothing running")
+        );
+    }
+
+    #[test]
+    fn a_daemon_too_old_to_itemise_its_storage_leaves_the_disk_rows_out() {
+        // Every category absent: the row would otherwise read "unknown" four times.
+        let page = environment(
+            &environment_summary(),
+            &resolved(),
+            &World::default().context(),
+        );
+
+        let footprint = page
+            .groups
+            .iter()
+            .find(|group| group.title == "Footprint")
+            .expect("the group is still there for the memory row");
+
+        assert_eq!(footprint.rows.len(), 1);
+        assert_eq!(footprint.rows[0].label, "Memory in use");
+    }
+
+    #[test]
+    fn the_images_page_reports_the_disk_the_daemon_actually_spent() {
+        let world = World::default()
+            .with_images(vec![sample_image()])
+            .with_disk(disk_usage());
+
+        let page = images(&world.context());
+
+        // The listing's sum counts a shared layer once per image that carries it; the
+        // daemon's figure counts it once.
+        assert_eq!(page.value("Summary", "Combined size"), Some("164.2 MB"));
+        assert_eq!(page.value("Summary", "On disk"), Some("14.8 GB"));
+        assert_eq!(page.value("Summary", "Reclaimable"), Some("12.6 GB"));
+    }
+
+    #[test]
+    fn the_images_page_falls_back_to_the_listing_when_the_daemon_does_not_itemise() {
+        let world = World::default().with_images(vec![sample_image()]);
+        let page = images(&world.context());
+
+        assert_eq!(page.value("Summary", "Combined size"), Some("164.2 MB"));
+        assert_eq!(page.value("Summary", "On disk"), None);
+    }
+
+    #[test]
+    fn a_running_containers_page_reports_what_it_is_holding_and_of_what() {
+        let world = World::default()
+            .with_containers(vec![sample_container()])
+            .with_stats(&sample_container().id, 716_800);
+
+        let page = container(&sample_container(), &world.context());
+
+        assert_eq!(
+            page.value("Memory", "In use"),
+            Some("716.8 kB of 8.0 GB (<0.1%)")
+        );
+    }
+
+    #[test]
+    fn a_running_container_awaiting_its_first_sample_says_so() {
+        let world = World::default().with_containers(vec![sample_container()]);
+        let page = container(&sample_container(), &world.context());
+
+        assert_eq!(page.value("Memory", "In use"), Some("not measured yet"));
+    }
+
+    #[test]
+    fn a_stopped_container_is_not_given_a_memory_group_at_all() {
+        let mut stopped = sample_container();
+        stopped.state = ContainerState::Exited;
+        let world = World::default().with_containers(vec![stopped.clone()]);
+
+        let page = container(&stopped, &world.context());
+
+        assert!(!page.group_titles().contains(&"Memory"));
     }
 }

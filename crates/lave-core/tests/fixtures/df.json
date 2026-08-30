@@ -1,0 +1,21 @@
+{
+  "LayersSize": 14783927715,
+  "ImageUsage": {
+    "ActiveCount": 4,
+    "Reclaimable": 12556632188,
+    "TotalCount": 16,
+    "TotalSize": 14783927715
+  },
+  "ContainerUsage": {
+    "ActiveCount": 1,
+    "Reclaimable": 17518592,
+    "TotalCount": 6,
+    "TotalSize": 17522688
+  },
+  "VolumeUsage": {},
+  "BuildCacheUsage": {
+    "Reclaimable": 7704593624,
+    "TotalCount": 103,
+    "TotalSize": 8023805715
+  }
+}

@@ -4,14 +4,15 @@
 //! schema, shows up here as a failing fixture test rather than as odd values in the UI.
 
 use bollard::models::{
+    ContainerMemoryStats as WireMemoryStats, ContainerStatsResponse as WireStats,
     ContainerSummary as WireContainer, ContainerSummaryStateEnum, EventMessage as WireEvent,
     ImageSummary as WireImage, MountPoint as WireMount, PortSummary as WirePort,
-    SystemInfo as WireInfo, SystemVersion as WireVersion,
+    SystemDataUsageResponse as WireDataUsage, SystemInfo as WireInfo, SystemVersion as WireVersion,
 };
 
 use super::{
-    ContainerState, ContainerSummary, EngineEvent, EnvironmentSummary, ImageSummary, MountSummary,
-    PortMapping,
+    ContainerState, ContainerStats, ContainerSummary, DiskCategory, DiskUsage, EngineEvent,
+    EnvironmentSummary, ImageSummary, MountSummary, PortMapping,
 };
 
 impl From<WireImage> for ImageSummary {
@@ -210,6 +211,104 @@ pub fn epoch_seconds(value: Option<&str>) -> i64 {
         .map_or(0, |time| time.timestamp())
 }
 
+/// One stats sample, reduced to the memory figures.
+///
+/// The page cache is taken out, exactly as `docker stats` does: a container that has
+/// merely read a large file otherwise appears to be holding all of it.
+pub fn container_stats(id: &str, wire: WireStats) -> ContainerStats {
+    let memory = wire.memory_stats.unwrap_or_default();
+
+    ContainerStats {
+        id: wire.id.unwrap_or_else(|| id.to_owned()),
+        memory_usage: memory_usage(&memory),
+        memory_limit: memory.limit.and_then(as_i64).unwrap_or(UNMEASURED),
+    }
+}
+
+/// Usage with the cache subtracted: `total_inactive_file` on cgroup v1,
+/// `inactive_file` on v2. Neither is subtracted if it exceeds the usage, which would
+/// be two samples that do not belong together.
+fn memory_usage(memory: &WireMemoryStats) -> i64 {
+    let Some(usage) = memory.usage else {
+        return UNMEASURED;
+    };
+
+    let cache = memory
+        .stats
+        .as_ref()
+        .and_then(|stats| {
+            stats
+                .get("total_inactive_file")
+                .or_else(|| stats.get("inactive_file"))
+        })
+        .copied()
+        .filter(|cache| *cache < usage)
+        .unwrap_or_default();
+
+    as_i64(usage - cache).unwrap_or(UNMEASURED)
+}
+
+/// Stands for a figure the daemon did not report. Negative rather than zero, so
+/// "not measured" and "measured as nothing" stay apart.
+const UNMEASURED: i64 = -1;
+
+fn as_i64(value: u64) -> Option<i64> {
+    i64::try_from(value).ok()
+}
+
+/// The daemon's storage accounting. Each category is a distinct wire type carrying the
+/// same four fields, so each is narrowed to ours here.
+pub fn disk_usage(wire: WireDataUsage) -> DiskUsage {
+    DiskUsage {
+        images: wire.image_usage.map(|usage| {
+            category(
+                usage.total_count,
+                usage.active_count,
+                usage.total_size,
+                usage.reclaimable,
+            )
+        }),
+        containers: wire.container_usage.map(|usage| {
+            category(
+                usage.total_count,
+                usage.active_count,
+                usage.total_size,
+                usage.reclaimable,
+            )
+        }),
+        volumes: wire.volume_usage.map(|usage| {
+            category(
+                usage.total_count,
+                usage.active_count,
+                usage.total_size,
+                usage.reclaimable,
+            )
+        }),
+        build_cache: wire.build_cache_usage.map(|usage| {
+            category(
+                usage.total_count,
+                usage.active_count,
+                usage.total_size,
+                usage.reclaimable,
+            )
+        }),
+    }
+}
+
+fn category(
+    total_count: Option<i64>,
+    active_count: Option<i64>,
+    size: Option<i64>,
+    reclaimable: Option<i64>,
+) -> DiskCategory {
+    DiskCategory {
+        total_count: total_count.unwrap_or_default(),
+        active_count: active_count.unwrap_or_default(),
+        size: size.unwrap_or_default(),
+        reclaimable: reclaimable.unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // expect is fine in tests; a failed assumption should abort the test.
@@ -228,6 +327,112 @@ mod tests {
             .into_iter()
             .map(ImageSummary::from)
             .collect()
+    }
+
+    const STATS: &str = include_str!("../../tests/fixtures/stats.json");
+    const DF: &str = include_str!("../../tests/fixtures/df.json");
+
+    fn memory_stats(usage: u64, cache: &[(&str, u64)]) -> WireMemoryStats {
+        WireMemoryStats {
+            usage: Some(usage),
+            limit: Some(8_000_000_000),
+            stats: Some(
+                cache
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), *value))
+                    .collect(),
+            ),
+            ..WireMemoryStats::default()
+        }
+    }
+
+    #[test]
+    fn a_stats_sample_reports_memory_with_the_page_cache_taken_out() {
+        let wire = serde_json::from_str::<WireStats>(STATS)
+            .expect("fixture parses as the daemon's stats sample");
+
+        let stats = container_stats("fallback", wire);
+
+        // The fixture is a container that has read a 120 MB file: nearly all of its
+        // 128 MB of usage is cache it is not really holding.
+        assert_eq!(stats.memory_usage, 716_800);
+        assert_eq!(stats.memory_limit, 64_960_094_208);
+        assert!(!stats.id.is_empty());
+        assert_ne!(stats.id, "fallback", "the sample names its own container");
+    }
+
+    #[test]
+    fn cgroup_v1_and_v2_name_the_cache_differently_and_both_are_honoured() {
+        let v1 = container_stats(
+            "web",
+            WireStats {
+                memory_stats: Some(memory_stats(1_000, &[("total_inactive_file", 400)])),
+                ..WireStats::default()
+            },
+        );
+        let v2 = container_stats(
+            "web",
+            WireStats {
+                memory_stats: Some(memory_stats(1_000, &[("inactive_file", 250)])),
+                ..WireStats::default()
+            },
+        );
+
+        assert_eq!(v1.memory_usage, 600);
+        assert_eq!(v2.memory_usage, 750);
+    }
+
+    #[test]
+    fn a_cache_figure_larger_than_the_usage_is_not_subtracted() {
+        // Two readings that do not belong together; a negative usage would be worse
+        // than an inflated one.
+        let stats = container_stats(
+            "web",
+            WireStats {
+                memory_stats: Some(memory_stats(1_000, &[("inactive_file", 4_000)])),
+                ..WireStats::default()
+            },
+        );
+
+        assert_eq!(stats.memory_usage, 1_000);
+    }
+
+    #[test]
+    fn a_sample_with_no_memory_in_it_falls_back_to_the_id_we_asked_for() {
+        // What a container that stopped between the listing and the sample answers.
+        let stats = container_stats("web", WireStats::default());
+
+        assert_eq!(stats.id, "web");
+        assert!(!stats.has_memory());
+        assert_eq!(stats.memory_limit, -1);
+    }
+
+    #[test]
+    fn disk_usage_carries_each_category_the_daemon_broke_down() {
+        let wire = serde_json::from_str::<WireDataUsage>(DF)
+            .expect("fixture parses as the daemon's disk usage");
+
+        let usage = disk_usage(wire);
+        let images = usage.images.expect("the fixture breaks images down");
+
+        assert_eq!(images.total_count, 16);
+        assert_eq!(images.active_count, 4);
+        assert_eq!(images.size, 14_783_927_715);
+        assert_eq!(images.reclaimable, 12_556_632_188);
+
+        // The fixture's host has no volumes; the daemon still names the category.
+        let volumes = usage.volumes.expect("an empty category is still reported");
+        assert_eq!(volumes.size, 0);
+    }
+
+    #[test]
+    fn a_daemon_that_does_not_itemise_leaves_the_categories_out() {
+        // API versions before 1.49 answer with the flat shape, which carries none of
+        // these keys. Omitting the rows beats inventing zeroes.
+        let usage = disk_usage(WireDataUsage::default());
+
+        assert_eq!(usage.images, None);
+        assert_eq!(usage.total_size(), None);
     }
 
     fn containers() -> Vec<ContainerSummary> {

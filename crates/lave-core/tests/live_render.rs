@@ -8,6 +8,7 @@
 
 use lave_core::endpoint::{SystemEnv, SystemPaths, resolve};
 use lave_core::engine::{ContainerEngine, bollard_engine::BollardEngine};
+use lave_core::model::metrics::StatsIndex;
 use lave_core::model::relations::{self, LayerIndex};
 use lave_core::model::tree::NodeId;
 use lave_core::model::{detail, dockerfile, tree};
@@ -92,10 +93,23 @@ async fn the_whole_read_path_produces_sensible_output() {
         layers.insert(&image.id, digests);
     }
 
+    let mut stats = StatsIndex::new();
+    for container in containers.iter().filter(|c| c.state.is_active()) {
+        let sample = engine
+            .container_stats(&container.id)
+            .await
+            .expect("container stats sampled");
+        stats.insert(sample);
+    }
+
+    let disk = engine.disk_usage().await.expect("disk usage read");
+
     let cx = detail::Context {
         images: &images,
         containers: &containers,
         layers: &layers,
+        stats: &stats,
+        disk: &disk,
         raw: None,
         now: now(),
         offset: utc(),

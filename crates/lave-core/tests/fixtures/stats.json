@@ -1,0 +1,111 @@
+{
+  "id": "76b2d9d0f8c2b8aaac90a43392bfb0b9efa7420d88b9e57c7b5444147e706d66",
+  "name": "/lave-stats-probe",
+  "os_type": "linux",
+  "read": "2026-08-30T12:00:30.40404948Z",
+  "cpu_stats": {
+    "cpu_usage": {
+      "total_usage": 45742000,
+      "usage_in_kernelmode": 19059000,
+      "usage_in_usermode": 26683000
+    },
+    "system_cpu_usage": 2748651170000000,
+    "online_cpus": 32,
+    "throttling_data": {
+      "periods": 0,
+      "throttled_periods": 0,
+      "throttled_time": 0
+    }
+  },
+  "memory_stats": {
+    "usage": 127975424,
+    "stats": {
+      "active_anon": 49152,
+      "active_file": 0,
+      "anon": 49152,
+      "anon_thp": 0,
+      "file": 127258624,
+      "file_dirty": 0,
+      "file_mapped": 0,
+      "file_writeback": 0,
+      "inactive_anon": 0,
+      "inactive_file": 127258624,
+      "kernel_stack": 16384,
+      "pgactivate": 0,
+      "pgdeactivate": 0,
+      "pgfault": 1933,
+      "pglazyfree": 0,
+      "pglazyfreed": 0,
+      "pgmajfault": 0,
+      "pgrefill": 0,
+      "pgscan": 0,
+      "pgsteal": 0,
+      "shmem": 0,
+      "slab": 553440,
+      "slab_reclaimable": 408520,
+      "slab_unreclaimable": 144920,
+      "sock": 0,
+      "thp_collapse_alloc": 0,
+      "thp_fault_alloc": 4,
+      "unevictable": 0,
+      "workingset_activate": 0,
+      "workingset_nodereclaim": 0,
+      "workingset_refault": 0
+    },
+    "limit": 64960094208
+  },
+  "networks": {
+    "eth0": {
+      "rx_bytes": 2264,
+      "rx_packets": 17,
+      "rx_errors": 0,
+      "rx_dropped": 0,
+      "tx_bytes": 126,
+      "tx_packets": 3,
+      "tx_errors": 0,
+      "tx_dropped": 0
+    }
+  },
+  "pids_stats": {
+    "current": 1,
+    "limit": 74179
+  },
+  "blkio_stats": {
+    "io_service_bytes_recursive": [
+      {
+        "major": 259,
+        "minor": 0,
+        "op": "read",
+        "value": 127258624
+      },
+      {
+        "major": 259,
+        "minor": 0,
+        "op": "write",
+        "value": 0
+      }
+    ],
+    "io_serviced_recursive": null,
+    "io_queue_recursive": null,
+    "io_service_time_recursive": null,
+    "io_wait_time_recursive": null,
+    "io_merged_recursive": null,
+    "io_time_recursive": null,
+    "sectors_recursive": null
+  },
+  "num_procs": 0,
+  "storage_stats": {},
+  "preread": "0001-01-01T00:00:00Z",
+  "precpu_stats": {
+    "cpu_usage": {
+      "total_usage": 0,
+      "usage_in_kernelmode": 0,
+      "usage_in_usermode": 0
+    },
+    "throttling_data": {
+      "periods": 0,
+      "throttled_periods": 0,
+      "throttled_time": 0
+    }
+  }
+}

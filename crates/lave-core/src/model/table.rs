@@ -9,6 +9,7 @@ use crate::engine::{ContainerSummary, ImageSummary};
 use super::format::{
     age, bytes, container_label, image_label, list_or_none, port, short_id, text_or_unknown,
 };
+use super::metrics::StatsIndex;
 use super::relations;
 use super::tree::{NodeId, Tone, sorted_containers, sorted_images, state_icon, state_tone};
 
@@ -257,7 +258,12 @@ pub fn process_list(containers: &[ContainerSummary], now: i64, include_stopped: 
 /// from the same preference: the question "do I care about stopped containers right now"
 /// has one answer, not one per page.
 #[must_use]
-pub fn containers(containers: &[ContainerSummary], now: i64, include_stopped: bool) -> Table {
+pub fn containers(
+    containers: &[ContainerSummary],
+    stats: &StatsIndex,
+    now: i64,
+    include_stopped: bool,
+) -> Table {
     let rows = sorted_containers(containers)
         .into_iter()
         .filter(|container| include_stopped || container.state.is_active())
@@ -270,6 +276,7 @@ pub fn containers(containers: &[ContainerSummary], now: i64, include_stopped: bo
                 cells: vec![
                     Cell::text(container_label(container)),
                     Cell::text(container.state.label()),
+                    memory_cell(container, stats),
                     Cell::text(if container.image.is_empty() {
                         short_id(&container.image_id)
                     } else {
@@ -287,6 +294,7 @@ pub fn containers(containers: &[ContainerSummary], now: i64, include_stopped: bo
         columns: vec![
             wide_column("Container"),
             column("State"),
+            numeric_column("Memory"),
             wide_column("Image"),
             column("Ports"),
             numeric_column("Created"),
@@ -296,13 +304,29 @@ pub fn containers(containers: &[ContainerSummary], now: i64, include_stopped: bo
     }
 }
 
+/// What a container is holding, or why there is no figure.
+///
+/// A container that is not executing holds nothing, which is a fact rather than a gap;
+/// one that is executing but has not been sampled sorts below zero, so a sort by memory
+/// gathers the unknowns at one end rather than mixing them in as zeroes.
+fn memory_cell(container: &ContainerSummary, stats: &StatsIndex) -> Cell {
+    if !container.state.is_active() {
+        return Cell::number("none", 0);
+    }
+
+    match stats.memory(&container.id) {
+        Some(usage) => Cell::number(bytes(usage), usage),
+        None => Cell::number("unknown", -1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // expect is fine in tests; a failed assumption should abort the test.
     #![allow(clippy::expect_used)]
 
     use super::*;
-    use crate::engine::{ContainerState, PortMapping};
+    use crate::engine::{ContainerState, ContainerStats, PortMapping};
 
     const NOW: i64 = 1_782_231_445;
 
@@ -450,11 +474,11 @@ mod tests {
             protocol: "tcp".to_owned(),
         }];
 
-        let table = containers(&[published], NOW, true);
+        let table = containers(&[published], &StatsIndex::new(), NOW, true);
 
         assert_eq!(
             table.column_titles(),
-            vec!["Container", "State", "Image", "Ports", "Created"]
+            vec!["Container", "State", "Memory", "Image", "Ports", "Created"]
         );
         assert_eq!(table.cell(0, "Container"), Some("web"));
         assert_eq!(table.cell(0, "State"), Some("running"));
@@ -467,6 +491,7 @@ mod tests {
     fn a_container_publishing_nothing_says_none_rather_than_leaving_a_gap() {
         let table = containers(
             &[container("web", "aaa", ContainerState::Exited)],
+            &StatsIndex::new(),
             NOW,
             true,
         );
@@ -479,7 +504,7 @@ mod tests {
         let mut anonymous = container("web", "aaa", ContainerState::Running);
         anonymous.image = String::new();
 
-        let table = containers(&[anonymous], NOW, true);
+        let table = containers(&[anonymous], &StatsIndex::new(), NOW, true);
 
         assert_eq!(table.cell(0, "Image"), Some("aaa"));
     }
@@ -491,6 +516,7 @@ mod tests {
                 container("alpha", "aaa", ContainerState::Running),
                 container("beta", "aaa", ContainerState::Exited),
             ],
+            &StatsIndex::new(),
             NOW,
             true,
         );
@@ -635,7 +661,7 @@ mod tests {
     fn every_table_names_itself_so_its_column_widths_can_be_stored() {
         let ids = [
             images(&[], &[], NOW, true).id,
-            containers(&[], NOW, true).id,
+            containers(&[], &StatsIndex::new(), NOW, true).id,
             process_list(&[], NOW, true).id,
         ];
 
@@ -651,7 +677,7 @@ mod tests {
     fn every_table_opens_newest_first_on_a_column_it_actually_has() {
         for table in [
             images(&[], &[], NOW, true),
-            containers(&[], NOW, true),
+            containers(&[], &StatsIndex::new(), NOW, true),
             process_list(&[], NOW, true),
         ] {
             let sort = table.default_sort.expect("every table opens sorted");
@@ -668,7 +694,84 @@ mod tests {
     #[test]
     fn empty_listings_produce_a_table_with_headings_and_no_rows() {
         assert!(images(&[], &[], NOW, true).rows.is_empty());
-        assert!(containers(&[], NOW, true).rows.is_empty());
-        assert_eq!(containers(&[], NOW, true).columns.len(), 5);
+        assert!(
+            containers(&[], &StatsIndex::new(), NOW, true)
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            containers(&[], &StatsIndex::new(), NOW, true).columns.len(),
+            6
+        );
+    }
+
+    #[test]
+    fn the_container_table_reports_what_each_running_container_is_holding() {
+        let mut stats = StatsIndex::new();
+        stats.insert(ContainerStats {
+            id: "id-web".to_owned(),
+            memory_usage: 164_231_172,
+            memory_limit: 8_000_000_000,
+        });
+
+        let table = containers(
+            &[
+                container("web", "aaa", ContainerState::Running),
+                container("db", "aaa", ContainerState::Running),
+                container("old", "aaa", ContainerState::Exited),
+            ],
+            &stats,
+            NOW,
+            true,
+        );
+
+        let memory = |name: &str| {
+            let row = (0..table.rows.len())
+                .find(|row| table.cell(*row, "Container") == Some(name))
+                .expect("the container is in the table");
+            table.cell(row, "Memory")
+        };
+
+        assert_eq!(memory("web"), Some("164.2 MB"));
+        assert_eq!(memory("db"), Some("unknown"), "running but not yet sampled");
+        assert_eq!(
+            memory("old"),
+            Some("none"),
+            "a stopped container holds nothing"
+        );
+    }
+
+    #[test]
+    fn memory_sorts_by_bytes_with_the_unmeasured_gathered_below_zero() {
+        let mut stats = StatsIndex::new();
+        stats.insert(ContainerStats {
+            id: "id-web".to_owned(),
+            memory_usage: 9,
+            memory_limit: 8_000_000_000,
+        });
+        stats.insert(ContainerStats {
+            id: "id-api".to_owned(),
+            memory_usage: 10_000,
+            memory_limit: 8_000_000_000,
+        });
+
+        let table = containers(
+            &[
+                container("api", "aaa", ContainerState::Running),
+                container("web", "aaa", ContainerState::Running),
+                container("db", "aaa", ContainerState::Running),
+                container("old", "aaa", ContainerState::Exited),
+            ],
+            &stats,
+            NOW,
+            true,
+        );
+
+        // Rows arrive in name order: api, db, old, web.
+        let memory = |row: usize| table.rows[row].cells[2].sort.clone();
+        assert_eq!(memory(0), Sort::Number(10_000));
+        assert_eq!(memory(1), Sort::Number(-1), "db was never sampled");
+        assert_eq!(memory(2), Sort::Number(0), "old holds nothing");
+        assert_eq!(memory(3), Sort::Number(9));
     }
 }

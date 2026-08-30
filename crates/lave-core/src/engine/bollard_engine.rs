@@ -9,18 +9,19 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{
-    ContainerArchiveInfoOptions, CreateContainerOptions, DownloadFromContainerOptions,
-    EventsOptions, ListContainersOptions, ListImagesOptions, LogsOptions, PruneImagesOptions,
-    RemoveContainerOptions, RemoveImageOptions, StopContainerOptions,
+    ContainerArchiveInfoOptions, CreateContainerOptions, DataUsageOptions,
+    DownloadFromContainerOptions, EventsOptions, ListContainersOptions, ListImagesOptions,
+    LogsOptions, PruneImagesOptions, RemoveContainerOptions, RemoveImageOptions, StatsOptions,
+    StopContainerOptions,
 };
 use bollard::{API_DEFAULT_VERSION, Docker};
 use futures_util::stream::{BoxStream, StreamExt};
 
-use super::convert::environment_summary;
+use super::convert::{self, environment_summary};
 use super::{
-    ContainerEngine, ContainerSummary, EngineError, EngineEvent, EnvironmentSummary, HistoryEntry,
-    ImageSummary, Lifecycle, LogChunk, LogOptions, LogStream, PathStat, PruneOutcome,
-    SCRATCH_LABEL,
+    ContainerEngine, ContainerStats, ContainerSummary, DiskUsage, EngineError, EngineEvent,
+    EnvironmentSummary, HistoryEntry, ImageSummary, Lifecycle, LogChunk, LogOptions, LogStream,
+    PathStat, PruneOutcome, SCRATCH_LABEL,
 };
 
 /// Long enough to ride out a busy daemon, short enough to fail visibly.
@@ -112,6 +113,37 @@ impl ContainerEngine for BollardEngine {
             .into_iter()
             .map(ContainerSummary::from)
             .collect())
+    }
+
+    async fn container_stats(&self, id: &str) -> Result<ContainerStats, EngineError> {
+        // `one_shot` skips the daemon's warm-up sample, which exists only so that CPU
+        // percentages have something to subtract. Memory needs no such history.
+        let options = StatsOptions {
+            stream: false,
+            one_shot: true,
+        };
+
+        let sample = self
+            .docker
+            .stats(id, Some(options))
+            .next()
+            .await
+            .ok_or_else(|| EngineError::NotFound {
+                what: format!("stats for container {id}"),
+            })?
+            .map_err(|error| self.translate(&error))?;
+
+        Ok(convert::container_stats(id, sample))
+    }
+
+    async fn disk_usage(&self) -> Result<DiskUsage, EngineError> {
+        let usage = self
+            .docker
+            .df(None::<DataUsageOptions>)
+            .await
+            .map_err(|error| self.translate(&error))?;
+
+        Ok(convert::disk_usage(usage))
     }
 
     async fn inspect_image(&self, id: &str) -> Result<serde_json::Value, EngineError> {

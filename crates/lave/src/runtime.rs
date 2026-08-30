@@ -13,8 +13,8 @@ use futures_util::stream::{AbortHandle, BoxStream, SelectAll};
 use lave_core::activity::{Activity, ActivityState, Effect, Signal};
 use lave_core::endpoint::{Resolved, SystemEnv, SystemPaths, resolve};
 use lave_core::engine::{
-    self, ContainerEngine, ContainerSummary, EngineError, EnvironmentSummary, ImageSummary,
-    Lifecycle, LogChunk, LogOptions, bollard_engine::BollardEngine,
+    self, ContainerEngine, ContainerSummary, DiskUsage, EngineError, EnvironmentSummary,
+    ImageSummary, Lifecycle, LogChunk, LogOptions, bollard_engine::BollardEngine,
 };
 use lave_core::indicator::Counts;
 use lave_core::model::action::Action;
@@ -22,6 +22,7 @@ use lave_core::model::dockerfile as dockerfile_model;
 use lave_core::model::format;
 use lave_core::model::fs_tree::{self, Indexer, Node};
 use lave_core::model::logs::{self as logs_model, LogLine};
+use lave_core::model::metrics::StatsIndex;
 use lave_core::model::relations::{self, LayerIndex};
 use lave_core::model::tree::NodeId;
 
@@ -32,6 +33,17 @@ use crate::indicator_tray::{self, TrayHandle};
 /// but a hundred simultaneous requests would still be rude to a busy daemon.
 const LAYER_FETCH_CONCURRENCY: usize = 8;
 
+/// How many containers to sample at once. Same reasoning as the layer fetch, and the
+/// same socket.
+const STATS_FETCH_CONCURRENCY: usize = 8;
+
+/// How often the running containers are re-sampled while connected.
+///
+/// Memory moves between daemon events, so it cannot ride on the event stream the way
+/// the listings do. Matched to what `docker stats` itself samples at: often enough to
+/// be current, rare enough that a quiet machine is left alone.
+const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Everything the window knows about the daemon at one moment.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -41,6 +53,10 @@ pub struct Snapshot {
     pub containers: Vec<ContainerSummary>,
     /// Layer digests per image, from which derivation is reconstructed.
     pub layers: LayerIndex,
+    /// The most recent memory sample per running container.
+    pub stats: StatsIndex,
+    /// What the daemon says its storage is spent on.
+    pub disk: DiskUsage,
 }
 
 /// What one connection accumulates. Bundled so the session functions keep a sane
@@ -51,6 +67,13 @@ struct SessionState {
     /// Cached across refreshes and reconnects: layer stacks do not change, so an image
     /// already inspected never needs inspecting again.
     layers: LayerIndex,
+    /// The containers that were executing at the last refresh: what the stats timer
+    /// samples between one listing and the next.
+    running: Vec<String>,
+    /// Kept between refreshes so a listing that arrives before the next sample still
+    /// carries the last figures rather than blanking the column.
+    stats: StatsIndex,
+    disk: DiskUsage,
 }
 
 /// Connection state, rendered as the status page when not connected.
@@ -137,6 +160,9 @@ pub enum Update {
         message: String,
         failed: bool,
     },
+    /// Fresh memory samples, without a new listing. Sent on the stats timer: the
+    /// listings have not changed, so only the figures are carried.
+    Stats(StatsIndex),
     /// A reconstructed Dockerfile, ready to display.
     Dockerfile {
         image_id: String,
@@ -227,6 +253,9 @@ async fn serve(
         activity: Activity::new(),
         counts: Counts::default(),
         layers: LayerIndex::new(),
+        running: Vec::new(),
+        stats: StatsIndex::new(),
+        disk: DiskUsage::default(),
     };
 
     let tray = if want_indicator {
@@ -332,8 +361,18 @@ async fn session(
     // clean up. Removing it here is why a crash cannot leak into the user's `docker ps`.
     sweep_scratch(engine).await;
 
+    // The listings ride on the daemon's events; the memory figures cannot, because they
+    // move without anything happening. The connection's own refresh has just sampled, so
+    // the immediate first tick is consumed here rather than repeating it.
+    let mut sampler = tokio::time::interval(STATS_INTERVAL);
+    sampler.tick().await;
+
     loop {
         let effects = tokio::select! {
+            _ = sampler.tick() => {
+                sample_stats(engine, state, updates).await;
+                Vec::new()
+            },
             // Only polled while a viewer is open; otherwise this branch parks forever.
             item = next_log(&mut followers) => {
                 consume_log(item, &mut transcripts, &mut aborts, updates).await;
@@ -454,6 +493,14 @@ async fn refresh(
     };
 
     fetch_layers(engine, &images, &mut state.layers).await;
+    state.stats.retain_known(&containers);
+    state.running = containers
+        .iter()
+        .filter(|container| container.state.is_active())
+        .map(|container| container.id.clone())
+        .collect();
+    fetch_stats(engine, &state.running, &mut state.stats).await;
+    fetch_disk_usage(engine, &mut state.disk).await;
 
     state.counts = Counts {
         images: images.len(),
@@ -478,8 +525,72 @@ async fn refresh(
             images,
             containers,
             layers: state.layers.clone(),
+            stats: state.stats.clone(),
+            disk: state.disk,
         })))
         .await;
+}
+
+/// Sample the memory of every container that is executing.
+///
+/// One request each, so this is bounded like the layer fetch. A container that stops
+/// between the listing and the sample simply fails, which costs its own figure and
+/// nothing else: the listings are what the page is built from, not this.
+async fn fetch_stats(engine: &BollardEngine, running: &[String], stats: &mut StatsIndex) {
+    if running.is_empty() {
+        return;
+    }
+
+    let sampled: Vec<Result<engine::ContainerStats, EngineError>> = futures_util::stream::iter(
+        running
+            .iter()
+            .map(|id| async move { engine.container_stats(id).await }),
+    )
+    .buffer_unordered(STATS_FETCH_CONCURRENCY)
+    .collect()
+    .await;
+
+    let mut failures = 0;
+    for result in sampled {
+        match result {
+            Ok(sample) => stats.insert(sample),
+            Err(error) => {
+                failures += 1;
+                tracing::debug!("could not sample a container: {error}");
+            }
+        }
+    }
+
+    if failures > 0 {
+        tracing::debug!(
+            "{failures} of {} containers could not be sampled",
+            running.len()
+        );
+    }
+}
+
+/// Re-sample on the timer and send the figures on their own, without a listing.
+///
+/// The window merges these into the snapshot it already has: nothing about what exists
+/// has changed, so rebuilding the tree for them would be work for nothing.
+async fn sample_stats(engine: &BollardEngine, state: &mut SessionState, updates: &Sender<Update>) {
+    if state.running.is_empty() {
+        return;
+    }
+
+    fetch_stats(engine, &state.running, &mut state.stats).await;
+    let _ = updates.send(Update::Stats(state.stats.clone())).await;
+}
+
+/// Ask the daemon what its storage is spent on.
+///
+/// Left as it was on failure rather than blanked: a stale figure is closer to the truth
+/// than no figure, and `/system/df` is the one call here that walks the disk.
+async fn fetch_disk_usage(engine: &BollardEngine, disk: &mut DiskUsage) {
+    match engine.disk_usage().await {
+        Ok(usage) => *disk = usage,
+        Err(error) => tracing::debug!("could not read disk usage: {error}"),
+    }
 }
 
 /// Fill in the layer stacks of images not seen before.

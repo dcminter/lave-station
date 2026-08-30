@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
 
 use super::{
-    ContainerEngine, ContainerSummary, EngineError, EngineEvent, EnvironmentSummary, HistoryEntry,
-    ImageSummary, Lifecycle, LogChunk, LogOptions, PathStat, PruneOutcome,
+    ContainerEngine, ContainerStats, ContainerSummary, DiskUsage, EngineError, EngineEvent,
+    EnvironmentSummary, HistoryEntry, ImageSummary, Lifecycle, LogChunk, LogOptions, PathStat,
+    PruneOutcome,
 };
 
 /// A mutating call the engine was asked to make.
@@ -39,6 +40,8 @@ pub struct FakeEngine {
     logs: Vec<LogChunk>,
     archive: Vec<u8>,
     stat: Option<PathStat>,
+    stats: BTreeMap<String, ContainerStats>,
+    disk: DiskUsage,
     failure: Option<EngineError>,
     calls: Arc<Mutex<Vec<EngineCall>>>,
 }
@@ -110,6 +113,19 @@ impl FakeEngine {
         self
     }
 
+    /// A memory sample for one container.
+    #[must_use]
+    pub fn with_stats(mut self, stats: ContainerStats) -> Self {
+        self.stats.insert(stats.id.clone(), stats);
+        self
+    }
+
+    #[must_use]
+    pub fn with_disk_usage(mut self, disk: DiskUsage) -> Self {
+        self.disk = disk;
+        self
+    }
+
     /// Make every call fail, for exercising error paths.
     #[must_use]
     pub fn failing(mut self, error: EngineError) -> Self {
@@ -161,6 +177,24 @@ impl ContainerEngine for FakeEngine {
     async fn list_containers(&self) -> Result<Vec<ContainerSummary>, EngineError> {
         self.check()?;
         Ok(self.containers.clone())
+    }
+
+    async fn container_stats(&self, id: &str) -> Result<ContainerStats, EngineError> {
+        self.check()?;
+        Ok(self
+            .stats
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| ContainerStats {
+                id: id.to_owned(),
+                memory_usage: -1,
+                memory_limit: -1,
+            }))
+    }
+
+    async fn disk_usage(&self) -> Result<DiskUsage, EngineError> {
+        self.check()?;
+        Ok(self.disk)
     }
 
     async fn inspect_image(&self, id: &str) -> Result<serde_json::Value, EngineError> {
