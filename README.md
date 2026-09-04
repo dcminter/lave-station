@@ -2,6 +2,8 @@
 
 A Gtk Based GUI for Docker, implemented in Rust, using native control of Docker.
 
+![Screen capture of the UI](./docs/screenshot.png)
+
 # Building and running
 
 Build prerequisites (Debian 13):
