@@ -49,12 +49,29 @@ impl TreeNodeObject {
         object
     }
 
-    /// Update in place, so expansion and selection survive a refresh.
+    /// Update in place, so the scroll position, the expansion, the selection and the
+    /// focus all survive a refresh.
+    ///
+    /// Only what has actually moved is set: each setter notifies, and a row redraws
+    /// itself on being notified, so setting a value back to itself is work for nothing
+    /// several times a minute per visible row.
     pub fn apply(&self, node: &TreeNode) {
-        self.set_key(node.id.key());
-        self.set_label(node.label.clone());
-        self.set_description(node.description.clone().unwrap_or_default());
-        self.set_icon(node.icon);
-        self.set_tone(node.tone.css_class());
+        let description = node.description.clone().unwrap_or_default();
+
+        if self.key() != node.id.key() {
+            self.set_key(node.id.key());
+        }
+        if self.label() != node.label {
+            self.set_label(node.label.clone());
+        }
+        if self.description() != description {
+            self.set_description(description);
+        }
+        if self.icon() != node.icon {
+            self.set_icon(node.icon);
+        }
+        if self.tone() != node.tone.css_class() {
+            self.set_tone(node.tone.css_class());
+        }
     }
 }

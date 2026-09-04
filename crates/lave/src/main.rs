@@ -7,6 +7,7 @@ mod fs_node;
 mod fuse_mount;
 mod group_columns;
 mod indicator_tray;
+mod list_rows;
 mod prefs;
 mod runtime;
 mod table_view;

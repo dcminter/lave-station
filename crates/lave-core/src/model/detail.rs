@@ -67,6 +67,9 @@ pub struct DetailPage {
     pub table_first: bool,
     /// When set, the table is offered with a filter toggle above it.
     pub table_filter: Option<TableFilter>,
+    /// A figure about the listing as a whole, shown in the strip above the table where
+    /// it is read alongside the rows it sums rather than below them.
+    pub table_summary: Option<String>,
     /// Pretty-printed inspect output, shown in a collapsed expander.
     pub raw: Option<String>,
     /// What the user may do to this object, decided in [`crate::model::action`].
@@ -227,6 +230,7 @@ pub fn environment(
         // daemon's own metadata is reference material below them.
         table_first: true,
         table_filter: Some(running_filter(cx, running)),
+        table_summary: None,
         raw: raw_json(cx.raw),
         actions: action::for_environment(cx.containers, cx.images),
     }
@@ -470,6 +474,7 @@ pub fn images(cx: &Context<'_>) -> DetailPage {
                 images.len() - untagged
             }),
         }),
+        table_summary: None,
         raw: None,
         actions: Vec::new(),
     }
@@ -511,8 +516,6 @@ pub fn containers(cx: &Context<'_>) -> DetailPage {
                 row("Exited", count(&ContainerState::Exited)),
                 row("Created", count(&ContainerState::Created)),
                 row("Other", other.to_string()),
-                // The host's own total is not on this page, so the figure stands alone.
-                row("Memory in use", memory_in_use(containers, cx.stats, None)),
             ],
         )],
         table: Some(table::containers(
@@ -523,6 +526,13 @@ pub fn containers(cx: &Context<'_>) -> DetailPage {
         )),
         table_first: true,
         table_filter: Some(running_filter(cx, count_running(containers))),
+        // Beside the table rather than in the summary below it: this totals the Memory
+        // column, and is read against it. The host's own total is not on this page, so
+        // the figure stands alone.
+        table_summary: Some(format!(
+            "Memory in use: {}",
+            memory_in_use(containers, cx.stats, None)
+        )),
         raw: None,
         actions: Vec::new(),
     }
@@ -570,6 +580,7 @@ pub fn image(image: &ImageSummary, cx: &Context<'_>) -> DetailPage {
         table: None,
         table_first: false,
         table_filter: None,
+        table_summary: None,
         raw: raw_json(cx.raw),
         actions: action::for_image(image, cx.containers),
     }
@@ -705,6 +716,7 @@ pub fn container(container: &ContainerSummary, cx: &Context<'_>) -> DetailPage {
         table: None,
         table_first: false,
         table_filter: None,
+        table_summary: None,
         raw: raw_json(cx.raw),
         actions: action::for_container(container, cx.images),
     }
@@ -1896,9 +1908,52 @@ mod tests {
         let page = containers(&world.context());
 
         assert_eq!(
-            page.value("Summary", "Memory in use"),
-            Some("700.0 MB in 1 container, 1 not measured")
+            page.table_summary.as_deref(),
+            Some("Memory in use: 700.0 MB in 1 container, 1 not measured")
         );
+    }
+
+    #[test]
+    fn the_containers_page_totals_the_memory_of_the_ones_that_are_running() {
+        let world = World::default()
+            .with_containers(vec![
+                named_container("web", "nginx:1.27", "abc"),
+                named_container("api", "nginx:1.27", "abc"),
+            ])
+            .with_stats("id-web", 700_000_000)
+            .with_stats("id-api", 300_000_000);
+
+        let page = containers(&world.context());
+
+        // Above the table, where it is read against the column it sums, rather than in
+        // the summary group below it.
+        assert_eq!(
+            page.table_summary.as_deref(),
+            Some("Memory in use: 1.0 GB across 2 containers")
+        );
+        assert_eq!(
+            page.value("Summary", "Memory in use"),
+            None,
+            "the figure is stated once"
+        );
+    }
+
+    #[test]
+    fn only_the_page_listing_containers_carries_a_table_summary() {
+        let world = World::default()
+            .with_containers(vec![named_container("web", "nginx:1.27", "abc")])
+            .with_images(vec![sample_image()])
+            .with_stats("id-web", 700_000_000);
+        let cx = world.context();
+
+        assert!(images(&cx).table_summary.is_none());
+        assert!(
+            environment(&environment_summary(), &resolved(), &cx)
+                .table_summary
+                .is_none(),
+            "the environment page has the same figure in its Footprint group"
+        );
+        assert!(container(&sample_container(), &cx).table_summary.is_none());
     }
 
     #[test]
@@ -1910,8 +1965,8 @@ mod tests {
         let page = containers(&world.context());
 
         assert_eq!(
-            page.value("Summary", "Memory in use"),
-            Some("nothing running")
+            page.table_summary.as_deref(),
+            Some("Memory in use: nothing running")
         );
     }
 

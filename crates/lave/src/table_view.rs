@@ -3,7 +3,9 @@
 //! No decisions here — the columns, their order and their sort keys all come from
 //! `lave_core::model::table`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+
 use std::rc::Rc;
 
 use gtk::glib;
@@ -28,13 +30,19 @@ pub fn apply_tone_class(icon: &gtk::Image, class: &str) {
 
 mod imp {
     use std::cell::RefCell;
+    use std::sync::OnceLock;
 
     use gtk::glib;
+    use gtk::glib::subclass::Signal;
     use gtk::subclass::prelude::*;
     use lave_core::model::table::Row;
 
     /// Holds a whole row: the cells are positional, which `glib::Properties` cannot
     /// express, and the factories are written in Rust so properties buy nothing here.
+    ///
+    /// The contents are replaced in place on a refresh rather than the object being
+    /// replaced in the model, so `updated` stands in for the notification a property
+    /// would have given: the cells bound to this row re-read themselves when it fires.
     #[derive(Default)]
     pub struct TableRowObject {
         pub row: RefCell<Option<Row>>,
@@ -46,8 +54,16 @@ mod imp {
         type Type = super::TableRowObject;
     }
 
-    impl ObjectImpl for TableRowObject {}
+    impl ObjectImpl for TableRowObject {
+        fn signals() -> &'static [Signal] {
+            static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+            SIGNALS.get_or_init(|| vec![Signal::builder(super::UPDATED).build()])
+        }
+    }
 }
+
+/// Emitted when a row's contents are replaced in place.
+const UPDATED: &str = "updated";
 
 glib::wrapper! {
     pub struct TableRowObject(ObjectSubclass<imp::TableRowObject>);
@@ -79,8 +95,29 @@ impl TableRowObject {
             .map(|cell| cell.sort.clone())
     }
 
-    fn key(&self) -> Option<NodeId> {
+    pub(crate) fn key(&self) -> Option<NodeId> {
         self.imp().row.borrow().as_ref().map(|row| row.key.clone())
+    }
+
+    /// Whether this object already holds that row, and so needs no replacing.
+    fn holds(&self, row: &Row) -> bool {
+        self.imp().row.borrow().as_ref() == Some(row)
+    }
+
+    /// Take fresh contents without leaving the model.
+    ///
+    /// This is the whole point of the object: a row that is replaced in the model takes
+    /// its widget with it, and the reader loses the row they had clicked, the focus that
+    /// went with it and the place they had scrolled to. A row updated in place keeps all
+    /// three, and the cells bound to it re-read themselves.
+    fn set_row(&self, row: Row) {
+        self.imp().row.replace(Some(row));
+        self.redraw();
+    }
+
+    /// Tell whatever is bound to this row to read it again.
+    fn redraw(&self) {
+        self.emit_by_name::<()>(UPDATED, &[]);
     }
 
     fn icon(&self) -> Option<&'static str> {
@@ -117,6 +154,10 @@ impl SortOrder {
 }
 
 /// What the window has to tell a table, beyond the rows themselves.
+///
+/// Cloned out of the cell the widgets hold before each call: a handler may redraw the
+/// pane, which swaps the cell's contents, and it must not do that through a live borrow.
+#[derive(Clone)]
 pub struct TableHandlers {
     /// A row was chosen, which is how the tables navigate to an object.
     pub activate: Rc<dyn Fn(NodeId)>,
@@ -132,81 +173,208 @@ pub struct TableHandlers {
     pub resized: Rc<dyn Fn(String, i32)>,
 }
 
-/// Build the table.
+/// A built table: the view, and the model that drives it.
 ///
-/// `sort` is already resolved by the caller — the session's order if the user has set
-/// one, the table's own default otherwise. `widths` are the widths the user has dragged
-/// columns to, by title; a column with none sizes itself.
-#[must_use]
-pub fn build(
-    table: &Table,
-    sort: &SortOrder,
-    widths: &BTreeMap<String, i32>,
-    handlers: &TableHandlers,
-) -> gtk::ColumnView {
-    let store = gtk::gio::ListStore::new::<TableRowObject>();
-    let objects: Vec<TableRowObject> = table
-        .rows
-        .iter()
-        .cloned()
-        .map(TableRowObject::new)
-        .collect();
-    store.splice(0, 0, &objects);
+/// Kept across redraws rather than rebuilt. A `GtkColumnView` is driven by its model, so
+/// a refresh replaces the rows in the store and leaves the widgets alone — which is what
+/// keeps the place the reader had scrolled to, the row they had clicked, the focus that
+/// went with it, and the widths they had dragged. Rebuilding the view loses all of it.
+pub struct TableView {
+    view: gtk::ColumnView,
+    store: gtk::gio::ListStore,
+    /// Swapped on every redraw: the handlers close over the page being shown, and these
+    /// widgets outlive it.
+    handlers: Rc<RefCell<TableHandlers>>,
+    /// The columns it was built for, by title. A table with different ones needs a new
+    /// view; a table with the same ones needs only new rows.
+    columns: Vec<String>,
+}
 
-    let view = gtk::ColumnView::builder()
-        .show_row_separators(true)
-        .single_click_activate(true)
-        .build();
-    view.add_css_class("data-table");
+impl TableView {
+    /// Build the table.
+    ///
+    /// `sort` is already resolved by the caller — the session's order if the user has set
+    /// one, the table's own default otherwise. `widths` are the widths the user has
+    /// dragged columns to, by title; a column with none sizes itself.
+    #[must_use]
+    pub fn new(
+        table: &Table,
+        sort: &SortOrder,
+        widths: &BTreeMap<String, i32>,
+        handlers: TableHandlers,
+    ) -> Self {
+        let store = gtk::gio::ListStore::new::<TableRowObject>();
+        let handlers = Rc::new(RefCell::new(handlers));
 
-    // The view's own sorter drives the model, so clicking a heading re-sorts.
-    let sorted = gtk::SortListModel::new(Some(store), view.sorter());
-    let selection = gtk::SingleSelection::new(Some(sorted));
-    selection.set_autoselect(false);
-    selection.set_can_unselect(true);
-    view.set_model(Some(&selection));
+        let view = gtk::ColumnView::builder()
+            .show_row_separators(true)
+            .single_click_activate(true)
+            .build();
+        view.add_css_class("data-table");
 
-    // Leading, so the checkboxes line up down the left edge whatever the table.
-    view.append_column(&build_check_column(handlers));
+        // The view's own sorter drives the model, so clicking a heading re-sorts.
+        let sorted = gtk::SortListModel::new(Some(store.clone()), view.sorter());
+        let selection = gtk::SingleSelection::new(Some(sorted));
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
+        view.set_model(Some(&selection));
 
-    for (index, column) in table.columns.iter().enumerate() {
-        let built = build_column(index, column, &handlers.context);
+        // Leading, so the checkboxes line up down the left edge whatever the table.
+        view.append_column(&build_check_column(&handlers));
 
-        // Restoring a width makes GTK notify, which reports the width we just set; the
-        // settings model treats storing an unchanged width as no change, so the store is
-        // not rewritten on every render.
-        if let Some(width) = widths.get(&column.title) {
-            built.set_fixed_width(*width);
+        for (index, column) in table.columns.iter().enumerate() {
+            let built = build_column(index, column, &handlers);
+
+            // Restoring a width makes GTK notify, which reports the width we just set;
+            // the settings model treats storing an unchanged width as no change, so the
+            // store is not rewritten on every render.
+            if let Some(width) = widths.get(&column.title) {
+                built.set_fixed_width(*width);
+            }
+
+            let cell = Rc::clone(&handlers);
+            let title = column.title.clone();
+            built.connect_fixed_width_notify(move |column| {
+                let resized = Rc::clone(&cell.borrow().resized);
+                resized(title.clone(), column.fixed_width());
+            });
+
+            view.append_column(&built);
         }
 
-        let resized = Rc::clone(&handlers.resized);
-        let title = column.title.clone();
-        built.connect_fixed_width_notify(move |column| {
-            resized(title.clone(), column.fixed_width());
+        apply_sort(&view, sort);
+        watch_sort(&view, &handlers);
+
+        let cell = Rc::clone(&handlers);
+        view.connect_activate(move |view, position| {
+            let Some(model) = view.model() else {
+                return;
+            };
+            let Some(node) = model
+                .item(position)
+                .and_downcast::<TableRowObject>()
+                .and_then(|row| row.key())
+            else {
+                return;
+            };
+            let activate = Rc::clone(&cell.borrow().activate);
+            activate(node);
         });
 
-        view.append_column(&built);
+        let built = Self {
+            view,
+            store,
+            handlers,
+            columns: table
+                .columns
+                .iter()
+                .map(|column| column.title.clone())
+                .collect(),
+        };
+        built.update(table, sort, None);
+        built
     }
 
-    apply_sort(&view, sort);
-    watch_sort(&view, Rc::clone(&handlers.sort_changed));
+    #[must_use]
+    pub fn widget(&self) -> &gtk::ColumnView {
+        &self.view
+    }
 
-    let on_activate = Rc::clone(&handlers.activate);
-    view.connect_activate(move |view, position| {
-        let Some(model) = view.model() else {
-            return;
-        };
-        let Some(node) = model
-            .item(position)
-            .and_downcast::<TableRowObject>()
-            .and_then(|row| row.key())
-        else {
-            return;
-        };
-        on_activate(node);
-    });
+    /// Whether this view can show that table, or must be built again for it.
+    #[must_use]
+    pub fn fits(&self, table: &Table) -> bool {
+        self.columns.len() == table.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&table.columns)
+                .all(|(title, column)| *title == column.title)
+    }
 
-    view
+    /// Sort as asked, unless that is already how the view is sorted.
+    ///
+    /// The view is where the user's own sorting lives — clicking a heading sorts it and
+    /// tells the window — so it is left alone unless it disagrees with what it is given.
+    fn sync_sort(&self, sort: &SortOrder) {
+        let sorted_by = self
+            .view
+            .sorter()
+            .and_downcast::<gtk::ColumnViewSorter>()
+            .map(|sorter| SortOrder {
+                column: sorter
+                    .primary_sort_column()
+                    .and_then(|column| column.title())
+                    .map(|title| title.to_string())
+                    .unwrap_or_default(),
+                descending: sorter.primary_sort_order() == gtk::SortType::Descending,
+            });
+
+        let agrees = sorted_by.is_some_and(|current| {
+            current.column == sort.column && current.descending == sort.descending
+        });
+        if !agrees {
+            apply_sort(&self.view, sort);
+        }
+    }
+
+    /// Redraw what the rows are showing, without changing what they hold.
+    ///
+    /// The ticks live in the window rather than in the rows, so a bulk selection changes
+    /// nothing here that the rows could notice by themselves.
+    pub fn redraw(&self) {
+        for object in self.store.iter::<TableRowObject>().flatten() {
+            object.redraw();
+        }
+    }
+
+    /// Show these rows, and answer to these handlers from now on.
+    ///
+    /// Row by row: a refresh that moved one figure replaces one row, and every other row
+    /// keeps the widget it already had. The sort, the column widths and the scroll
+    /// position all live in the view, which is not touched.
+    pub fn update(&self, table: &Table, sort: &SortOrder, handlers: Option<TableHandlers>) {
+        if let Some(handlers) = handlers {
+            self.handlers.replace(handlers);
+        }
+
+        self.sync_sort(sort);
+
+        let held: Vec<TableRowObject> = self.store.iter::<TableRowObject>().flatten().collect();
+
+        // The same objects, still in the same order, describing the same things? Then
+        // this is a refresh of the figures, and every row keeps the widget it has.
+        let same_objects = held.len() == table.rows.len()
+            && held
+                .iter()
+                .zip(&table.rows)
+                .all(|(object, row)| object.key().as_ref() == Some(&row.key));
+
+        if !same_objects {
+            // Rows have come or gone: there is no row-for-row correspondence to keep.
+            let objects: Vec<TableRowObject> = table
+                .rows
+                .iter()
+                .cloned()
+                .map(TableRowObject::new)
+                .collect();
+            self.store.splice(0, self.store.n_items(), &objects);
+            return;
+        }
+
+        let mut moved = false;
+        for (object, row) in held.iter().zip(&table.rows) {
+            if !object.holds(row) {
+                object.set_row(row.clone());
+                moved = true;
+            }
+        }
+
+        // Sorting is by the values that have just changed, so the order has to be asked
+        // for again: nothing was added or removed to ask on the model's behalf.
+        if moved && let Some(sorter) = self.view.sorter() {
+            sorter.changed(gtk::SorterChange::Different);
+        }
+    }
 }
 
 /// The leading column of checkboxes, which is what makes a bulk action possible.
@@ -214,10 +382,10 @@ pub fn build(
 /// The checked set lives in the window rather than in the widgets: the pane is rebuilt
 /// whenever a refresh arrives, and ticks that vanished on every daemon event would be
 /// unusable.
-fn build_check_column(handlers: &TableHandlers) -> gtk::ColumnViewColumn {
+fn build_check_column(handlers: &Rc<RefCell<TableHandlers>>) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
 
-    let toggle = Rc::clone(&handlers.toggle);
+    let toggle = Rc::clone(handlers);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -242,6 +410,7 @@ fn build_check_column(handlers: &TableHandlers) -> gtk::ColumnViewColumn {
                     .and_downcast::<TableRowObject>()
                     .and_then(|row| row.key())
                 {
+                    let toggle = Rc::clone(&toggle.borrow().toggle);
                     toggle(node, check.is_active());
                 }
             }
@@ -250,26 +419,29 @@ fn build_check_column(handlers: &TableHandlers) -> gtk::ColumnViewColumn {
         item.set_child(Some(&check));
     });
 
-    let checked = Rc::clone(&handlers.checked);
-    factory.connect_bind(move |_, item| {
-        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
-            return;
-        };
-        let Some(check) = item.child().and_downcast::<gtk::CheckButton>() else {
-            return;
-        };
-        let Some(node) = item
-            .item()
-            .and_downcast::<TableRowObject>()
-            .and_then(|row| row.key())
-        else {
-            return;
-        };
+    let checked = Rc::clone(handlers);
+    crate::list_rows::follow(
+        &factory,
+        UPDATED,
+        |item| item.item().and_downcast::<TableRowObject>(),
+        move |item| {
+            let Some(check) = item.child().and_downcast::<gtk::CheckButton>() else {
+                return;
+            };
+            let Some(node) = item
+                .item()
+                .and_downcast::<TableRowObject>()
+                .and_then(|row| row.key())
+            else {
+                return;
+            };
 
-        // Setting this fires `toggled`, which writes back the value just read. Toggling
-        // is idempotent, so the round trip changes nothing.
-        check.set_active(checked(&node));
-    });
+            // Setting this fires `toggled`, which writes back the value just read. Toggling
+            // is idempotent, so the round trip changes nothing.
+            let checked = Rc::clone(&checked.borrow().checked);
+            check.set_active(checked(&node));
+        },
+    );
 
     gtk::ColumnViewColumn::builder()
         .title("")
@@ -306,11 +478,12 @@ fn apply_sort(view: &gtk::ColumnView, sort: &SortOrder) {
 
 /// Report the user re-sorting. Connected after the initial sort is applied, so
 /// restoring a stored order does not immediately write it back.
-fn watch_sort(view: &gtk::ColumnView, on_sort_changed: Rc<dyn Fn(SortOrder)>) {
+fn watch_sort(view: &gtk::ColumnView, handlers: &Rc<RefCell<TableHandlers>>) {
     let Some(sorter) = view.sorter().and_downcast::<gtk::ColumnViewSorter>() else {
         return;
     };
 
+    let handlers = Rc::clone(handlers);
     sorter.connect_changed(move |sorter, _| {
         let column = sorter
             .primary_sort_column()
@@ -318,6 +491,7 @@ fn watch_sort(view: &gtk::ColumnView, on_sort_changed: Rc<dyn Fn(SortOrder)>) {
             .map(|title| title.to_string())
             .unwrap_or_default();
 
+        let on_sort_changed = Rc::clone(&handlers.borrow().sort_changed);
         on_sort_changed(SortOrder {
             column,
             descending: sorter.primary_sort_order() == gtk::SortType::Descending,
@@ -328,14 +502,14 @@ fn watch_sort(view: &gtk::ColumnView, on_sort_changed: Rc<dyn Fn(SortOrder)>) {
 fn build_column(
     index: usize,
     column: &lave_core::model::table::Column,
-    on_context: &Rc<dyn Fn(NodeId, gtk::Widget, f64, f64)>,
+    handlers: &Rc<RefCell<TableHandlers>>,
 ) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     let numeric = column.numeric;
     // Only the first column names the object, so only it carries the icon.
     let with_icon = index == 0;
 
-    let on_context = Rc::clone(on_context);
+    let on_context = Rc::clone(handlers);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -386,6 +560,7 @@ fn build_column(
                 // the pane out from under the menu that was about to open.
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 if let Some(widget) = gesture.widget() {
+                    let on_context = Rc::clone(&on_context.borrow().context);
                     on_context(node, widget, x, y);
                 }
             }
@@ -395,37 +570,12 @@ fn build_column(
         item.set_child(Some(&child));
     });
 
-    factory.connect_bind(move |_, item| {
-        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
-            return;
-        };
-        let Some(row) = item.item().and_downcast::<TableRowObject>() else {
-            return;
-        };
-        let Some(child) = item.child() else {
-            return;
-        };
-
-        let label = if with_icon {
-            let Some(content) = child.downcast_ref::<gtk::Box>() else {
-                return;
-            };
-            let Some(icon) = content.first_child().and_downcast::<gtk::Image>() else {
-                return;
-            };
-            icon.set_icon_name(row.icon());
-            apply_tone(&icon, row.tone());
-            icon.next_sibling().and_downcast::<gtk::Label>()
-        } else {
-            child.downcast::<gtk::Label>().ok()
-        };
-
-        if let Some(label) = label {
-            let text = row.cell_text(index);
-            label.set_tooltip_text(Some(&text));
-            label.set_label(&text);
-        }
-    });
+    crate::list_rows::follow(
+        &factory,
+        UPDATED,
+        |item| item.item().and_downcast::<TableRowObject>(),
+        move |item| draw_cell(item, index, with_icon),
+    );
 
     gtk::ColumnViewColumn::builder()
         .title(&column.title)
@@ -434,6 +584,36 @@ fn build_column(
         .expand(column.expand)
         .sorter(&column_sorter(index))
         .build()
+}
+
+/// Draw one cell from the row its list item currently holds.
+fn draw_cell(item: &gtk::ListItem, index: usize, with_icon: bool) {
+    let Some(row) = item.item().and_downcast::<TableRowObject>() else {
+        return;
+    };
+    let Some(child) = item.child() else {
+        return;
+    };
+
+    let label = if with_icon {
+        let Some(content) = child.downcast_ref::<gtk::Box>() else {
+            return;
+        };
+        let Some(icon) = content.first_child().and_downcast::<gtk::Image>() else {
+            return;
+        };
+        icon.set_icon_name(row.icon());
+        apply_tone(&icon, row.tone());
+        icon.next_sibling().and_downcast::<gtk::Label>()
+    } else {
+        child.downcast::<gtk::Label>().ok()
+    };
+
+    if let Some(label) = label {
+        let text = row.cell_text(index);
+        label.set_tooltip_text(Some(&text));
+        label.set_label(&text);
+    }
 }
 
 /// Sorts by the cell's key rather than by the text it shows, so sizes and ages order

@@ -433,7 +433,11 @@ impl LaveWindow {
         };
 
         self.imp().status_page.set_title(title);
-        self.imp().status_page.set_description(Some(&description));
+        // The description is markup and has no plain-text mode, so a daemon's own
+        // wording — which may contain "<" — is escaped rather than parsed.
+        self.imp()
+            .status_page
+            .set_description(Some(&glib::markup_escape_text(&description)));
         self.imp().content_stack.set_visible_child_name("status");
     }
 
@@ -883,16 +887,8 @@ impl LaveWindow {
             }
         }
 
+        // Redraws every row's tick, which is all that has changed.
         self.update_bulk_controls();
-
-        // The ticks live in the window, so the rows have to be rebuilt to redraw theirs —
-        // but not from inside the control's own signal handler, which the rebuild would
-        // destroy while it is still running.
-        glib::idle_add_local_once(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move || window.render_detail()
-        ));
     }
 
     /// Bring the cog and the select-all control into line with what is checked.
@@ -901,6 +897,12 @@ impl LaveWindow {
     /// to act on; select-all shows the mixed state when only some rows are ticked.
     fn update_bulk_controls(&self) {
         let tally = self.tally();
+
+        // The ticks live here rather than in the rows, so the rows are told to read them
+        // again. Told, not rebuilt: a redraw would cost the reader their place.
+        if let Some(tab) = self.viewed() {
+            tab.surface.refresh_checks();
+        }
 
         if let Some(cog) = self.imp().cog.borrow().as_ref() {
             cog.set_sensitive(tally.any());
@@ -1738,6 +1740,7 @@ impl LaveWindow {
         // action having done nothing.
         let toast = adw::Toast::builder()
             .title(message)
+            .use_markup(false)
             .timeout(if failed { 8 } else { 3 })
             .build();
         self.imp().toasts.add_toast(toast);
@@ -1748,7 +1751,13 @@ impl LaveWindow {
             return;
         }
         self.imp().last_toast.replace(message.to_owned());
-        self.imp().toasts.add_toast(adw::Toast::new(message));
+        // Plain text: a daemon's message is not markup, and one containing "<" would be
+        // dropped rather than shown.
+        let toast = adw::Toast::builder()
+            .title(message)
+            .use_markup(false)
+            .build();
+        self.imp().toasts.add_toast(toast);
     }
 
     fn selected(&self) -> NodeId {
@@ -2267,7 +2276,29 @@ impl LaveWindow {
 
 /// Replace a store's contents. Image and container rows have no children, so nothing
 /// expansion-related is lost by rebuilding them.
+/// Bring a branch of the sidebar into line with a fresh listing.
+///
+/// The objects are kept and updated wherever the listing still names the same things in
+/// the same order. Replacing them would take the row widgets with them, and the reader
+/// would lose the place they had scrolled to, the row they had clicked, and the focus
+/// that went with it — every few seconds, for as long as the daemon keeps talking.
 fn fill(store: &gtk::gio::ListStore, nodes: &[TreeNode]) {
+    let held: Vec<TreeNodeObject> = store.iter::<TreeNodeObject>().flatten().collect();
+
+    let same_objects = held.len() == nodes.len()
+        && held
+            .iter()
+            .zip(nodes)
+            .all(|(object, node)| object.key() == node.id.key());
+
+    if same_objects {
+        for (object, node) in held.iter().zip(nodes) {
+            object.apply(node);
+        }
+        return;
+    }
+
+    // Something has come or gone, so there is no row-for-row correspondence to keep.
     let objects: Vec<TreeNodeObject> = nodes.iter().map(TreeNodeObject::from_node).collect();
     store.splice(0, store.n_items(), &objects);
 }
@@ -2327,41 +2358,53 @@ fn build_factory() -> gtk::SignalListItemFactory {
         item.set_child(Some(&expander));
     });
 
-    factory.connect_bind(|_, item| {
-        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
-            return;
-        };
-        let Some(row) = item.item().and_downcast::<gtk::TreeListRow>() else {
-            return;
-        };
-        let Some(node) = row.item().and_downcast::<TreeNodeObject>() else {
-            return;
-        };
-        let Some(expander) = item.child().and_downcast::<gtk::TreeExpander>() else {
-            return;
-        };
-
-        expander.set_list_row(Some(&row));
-
-        let Some(content) = expander.child().and_downcast::<gtk::Box>() else {
-            return;
-        };
-        let Some(icon) = content.first_child().and_downcast::<gtk::Image>() else {
-            return;
-        };
-        let Some(label) = icon.next_sibling().and_downcast::<gtk::Label>() else {
-            return;
-        };
-
-        icon.set_icon_name(Some(&node.icon()));
-        crate::table_view::apply_tone_class(&icon, &node.tone());
-        label.set_label(&node.label());
-        // The row shows the name alone; the count or state is spoken rather than drawn.
-        let spoken = format!("{} {}", node.label(), node.description());
-        expander.update_property(&[gtk::accessible::Property::Label(spoken.trim_end())]);
-    });
+    // A node is updated in place rather than replaced on a refresh, so the row follows
+    // its node's properties rather than being drawn once at bind and left.
+    crate::list_rows::follow(
+        &factory,
+        "notify",
+        |item| {
+            item.item()
+                .and_downcast::<gtk::TreeListRow>()
+                .and_then(|row| row.item())
+                .and_downcast::<TreeNodeObject>()
+        },
+        draw_tree_row,
+    );
 
     factory
+}
+
+/// Draw one sidebar row from the node its list item currently holds.
+fn draw_tree_row(item: &gtk::ListItem) {
+    let Some(row) = item.item().and_downcast::<gtk::TreeListRow>() else {
+        return;
+    };
+    let Some(node) = row.item().and_downcast::<TreeNodeObject>() else {
+        return;
+    };
+    let Some(expander) = item.child().and_downcast::<gtk::TreeExpander>() else {
+        return;
+    };
+
+    expander.set_list_row(Some(&row));
+
+    let Some(content) = expander.child().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    let Some(icon) = content.first_child().and_downcast::<gtk::Image>() else {
+        return;
+    };
+    let Some(label) = icon.next_sibling().and_downcast::<gtk::Label>() else {
+        return;
+    };
+
+    icon.set_icon_name(Some(&node.icon()));
+    crate::table_view::apply_tone_class(&icon, &node.tone());
+    label.set_label(&node.label());
+    // The row shows the name alone; the count or state is spoken rather than drawn.
+    let spoken = format!("{} {}", node.label(), node.description());
+    expander.update_property(&[gtk::accessible::Property::Label(spoken.trim_end())]);
 }
 
 /// One line of a menu, in the terms the widget layer needs: what the core decided,
@@ -2772,11 +2815,45 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use std::cell::Cell;
+    use std::sync::Mutex;
 
     use lave_core::engine::{ContainerState, ContainerSummary};
     use lave_core::model::relations::LayerIndex;
 
     use super::*;
+
+    /// Every message `GLib` logged since the writer was installed.
+    ///
+    /// A markup parse failure is reported by warning alone: the label recovers as soon as
+    /// `use-markup` is turned off after it, so the widget's own state says nothing about
+    /// whether the value was ever handed to the parser. The log is the only witness.
+    static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// GTK logs through the structured API, which goes to the writer and not to the
+    /// handler set by `g_log_set_default_handler`. The messages are still written out.
+    fn record_logging() {
+        glib::log_set_writer_func(|level, fields| {
+            for field in fields {
+                if field.key() == "MESSAGE"
+                    && let Some(message) = field.value_str()
+                {
+                    LOGGED
+                        .lock()
+                        .expect("the log is not held across a panic")
+                        .push(message.to_owned());
+                }
+            }
+            glib::log_writer_default(level, fields)
+        });
+    }
+
+    /// What has been logged so far, oldest first.
+    fn logged() -> Vec<String> {
+        LOGGED
+            .lock()
+            .expect("the log is not held across a panic")
+            .clone()
+    }
 
     fn entries() -> Vec<MenuEntry> {
         vec![
@@ -2818,12 +2895,23 @@ mod tests {
         adw::init().expect(
             "these tests need a display: run them with one, or without --features live-gtk",
         );
+        record_logging();
 
         the_context_menu_behaves_as_a_context_menu();
         an_object_page_leads_with_its_actions();
+        a_listing_page_states_its_memory_total_beside_the_table();
+        a_row_shows_its_value_verbatim_rather_than_as_markup();
         let window = detail_pages_get_a_tab_each_and_keep_it();
         the_tab_menu_offers_only_what_it_can_close(&window);
         a_sample_that_says_nothing_new_does_not_rebuild_the_pane(&window);
+        the_containers_panel_keeps_its_place_across_a_refresh(&window);
+        a_click_survives_a_refresh(&window);
+        checking_every_row_shows_the_ticks(&window);
+        a_table_sorted_by_a_live_column_reorders_as_the_figures_move(&window);
+        the_sidebar_keeps_its_place_across_a_refresh(&window);
+        a_containers_page_keeps_its_place_across_a_refresh(&window);
+        a_selected_value_survives_a_refresh(&window);
+        a_value_that_goes_away_does_not_take_the_page_with_it(&window);
     }
 
     fn the_context_menu_behaves_as_a_context_menu() {
@@ -2993,6 +3081,137 @@ mod tests {
         );
     }
 
+    /// The first descendant of a given type that answers a question, depth-first.
+    fn descendant<T: IsA<gtk::Widget>>(
+        root: &impl IsA<gtk::Widget>,
+        wanted: impl Fn(&T) -> bool,
+    ) -> Option<T> {
+        let mut stack = vec![root.clone().upcast::<gtk::Widget>()];
+
+        while let Some(node) = stack.pop() {
+            if let Ok(found) = node.clone().downcast::<T>()
+                && wanted(&found)
+            {
+                return Some(found);
+            }
+            let mut child = node.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                stack.push(widget);
+            }
+        }
+
+        None
+    }
+
+    /// One running container, sampled, as a page can be built from.
+    fn sampled(usage: i64, limit: i64) -> (Vec<ContainerSummary>, StatsIndex) {
+        let container = ContainerSummary {
+            id: "abc123".to_owned(),
+            names: vec!["web".to_owned()],
+            state: ContainerState::Running,
+            ..ContainerSummary::default()
+        };
+        let mut samples = StatsIndex::new();
+        samples.insert(lave_core::engine::ContainerStats {
+            id: container.id.clone(),
+            memory_usage: usage,
+            memory_limit: limit,
+        });
+        (vec![container], samples)
+    }
+
+    fn rendered(page: &detail::DetailPage) -> detail_pane::Surface {
+        let surface = detail_pane::Surface::new();
+        let state = detail_pane::TableState {
+            sort: SortOrder::default(),
+            widths: BTreeMap::new(),
+        };
+        detail_pane::render(
+            &surface,
+            page,
+            &state,
+            &recording(&Rc::new(Cell::new(None))),
+        );
+        surface
+    }
+
+    fn a_listing_page_states_its_memory_total_beside_the_table() {
+        let (containers, samples) = sampled(700_000_000, 8_000_000_000);
+        let layers = LayerIndex::new();
+        let disk = lave_core::engine::DiskUsage::default();
+        let cx = detail::Context {
+            images: &[],
+            containers: &containers,
+            layers: &layers,
+            stats: &samples,
+            disk: &disk,
+            raw: None,
+            now: 0,
+            offset: chrono::FixedOffset::east_opt(0).expect("UTC is a valid offset"),
+            show_stopped: false,
+            show_untagged: false,
+        };
+
+        let surface = rendered(&detail::containers(&cx));
+
+        // In the strip above the table, so the total is read with the rows it sums
+        // rather than after scrolling past them.
+        let label = descendant::<gtk::Label>(&surface.lead, |label| {
+            label.text().starts_with("Memory in use")
+        })
+        .expect("the containers page totals its memory above the table");
+
+        assert_eq!(label.text(), "Memory in use: 700.0 MB in 1 container");
+    }
+
+    fn a_row_shows_its_value_verbatim_rather_than_as_markup() {
+        // The regression: a value is plain text, but a row parses it as Pango markup by
+        // default, and "<0.1%" is not markup — GTK dropped the whole label.
+        let (containers, samples) = sampled(2_000_000, 8_000_000_000);
+        let layers = LayerIndex::new();
+        let disk = lave_core::engine::DiskUsage::default();
+        let cx = detail::Context {
+            images: &[],
+            containers: &containers,
+            layers: &layers,
+            stats: &samples,
+            disk: &disk,
+            raw: None,
+            now: 0,
+            offset: chrono::FixedOffset::east_opt(0).expect("UTC is a valid offset"),
+            show_stopped: false,
+            show_untagged: false,
+        };
+
+        let page = detail::container(&containers[0], &cx);
+        assert_eq!(
+            page.value("Memory", "In use"),
+            Some("2.0 MB of 8.0 GB (<0.1%)"),
+            "the value this test is about"
+        );
+
+        let before = logged().len();
+        let surface = rendered(&page);
+        let row = descendant::<adw::ActionRow>(&surface.body, |row| row.title() == "In use")
+            .expect("the memory row is on the page");
+
+        assert!(!row.uses_markup(), "a row's text is not markup");
+        assert_eq!(row.subtitle().as_deref(), Some("2.0 MB of 8.0 GB (<0.1%)"));
+
+        // Turning markup off after the value is set is too late: the row parses each
+        // value as it arrives, so the parser must be off before the value, not after.
+        let complaints: Vec<String> = logged()
+            .split_off(before)
+            .into_iter()
+            .filter(|message| message.contains("markup"))
+            .collect();
+        assert!(
+            complaints.is_empty(),
+            "rendering a row must provoke no markup complaint: {complaints:?}"
+        );
+    }
+
     fn detail_pages_get_a_tab_each_and_keep_it() -> LaveWindow {
         // Opening a page for a container must take nothing away: not the daemon's page,
         // which version 5 replaced, and not the previous container's, which the first cut
@@ -3102,6 +3321,730 @@ mod tests {
         }
     }
 
+    /// Let GTK get on with it: events, frame ticks and the idles they queue, until the
+    /// widgets have been laid out. Bounded, so a test cannot hang.
+    fn settle() {
+        let context = glib::MainContext::default();
+        for _ in 0..2_000 {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A listing with enough rows to scroll, sampled so a refresh can change something.
+    fn snapshot_of(count: usize, usage: i64) -> Snapshot {
+        let mut containers = Vec::new();
+        let mut stats = StatsIndex::new();
+        for index in 0..count {
+            let id = format!("c{index:03}");
+            containers.push(ContainerSummary {
+                id: id.clone(),
+                names: vec![format!("worker-{index:03}")],
+                image: "nginx:1.27".to_owned(),
+                state: ContainerState::Running,
+                ..ContainerSummary::default()
+            });
+            stats.insert(lave_core::engine::ContainerStats {
+                id,
+                memory_usage: usage,
+                memory_limit: 8_000_000_000,
+            });
+        }
+
+        Snapshot {
+            resolved: lave_core::endpoint::Resolved {
+                endpoint: lave_core::endpoint::Endpoint::Unix("/var/run/docker.sock".into()),
+                source: lave_core::endpoint::EndpointSource::RootfulSocket,
+            },
+            environment: lave_core::engine::EnvironmentSummary::default(),
+            images: Vec::new(),
+            containers,
+            layers: LayerIndex::new(),
+            stats,
+            disk: lave_core::engine::DiskUsage::default(),
+        }
+    }
+
+    /// The real thing: a laid-out window, scrolled by hand, refreshed as the daemon
+    /// refreshes it. Where the reader was must still be under them afterwards.
+    #[allow(clippy::float_cmp)]
+    fn the_containers_panel_keeps_its_place_across_a_refresh(window: &LaveWindow) {
+        window.apply_snapshot(snapshot_of(60, 1_000_000));
+
+        let listing = NodeId::Containers;
+        let tab = window.detail_tab(&listing);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.set_default_size(1000, 500);
+        window.present();
+        window.render_detail();
+        settle();
+
+        let surface = window
+            .detail_tab_for(&listing)
+            .expect("the containers listing has a tab")
+            .surface;
+        let scroller = descendant::<gtk::ScrolledWindow>(&surface.lead, |_| true)
+            .expect("the listing's table scrolls");
+        let adjustment = scroller.vadjustment();
+        assert!(
+            adjustment.upper() > adjustment.page_size() + 200.0,
+            "sixty rows must be taller than the pane, or there is nothing to scroll: \
+             upper {} page {}",
+            adjustment.upper(),
+            adjustment.page_size()
+        );
+
+        adjustment.set_value(200.0);
+        settle();
+        assert_eq!(adjustment.value(), 200.0, "the reader scrolled down");
+
+        window.apply_stats(snapshot_of(60, 900_000_000).stats);
+        settle();
+
+        let redrawn = descendant::<gtk::ScrolledWindow>(&surface.lead, |_| true)
+            .expect("the listing still scrolls");
+        assert_eq!(
+            redrawn.vadjustment().value(),
+            200.0,
+            "a sample must not throw the reader back to the top"
+        );
+
+        // The listing is redrawn by the whole snapshot too, which is what actually
+        // arrives from the daemon every few seconds.
+        window.apply_snapshot(snapshot_of(60, 500_000_000));
+        settle();
+
+        let redrawn = descendant::<gtk::ScrolledWindow>(&surface.lead, |_| true)
+            .expect("the listing still scrolls");
+        assert_eq!(
+            redrawn.vadjustment().value(),
+            200.0,
+            "a snapshot must not throw the reader back to the top either"
+        );
+
+        // Two redraws before GTK has had a frame to lay the first one out. A snapshot
+        // and a sample landing in the same turn do exactly this, and the second redraw
+        // must not take the empty scroller the first just built for the reader's place.
+        window.apply_stats(snapshot_of(60, 700_000_000).stats);
+        window.apply_stats(snapshot_of(60, 300_000_000).stats);
+        settle();
+
+        let redrawn = descendant::<gtk::ScrolledWindow>(&surface.lead, |_| true)
+            .expect("the listing still scrolls");
+        assert_eq!(
+            redrawn.vadjustment().value(),
+            200.0,
+            "two redraws in a turn must not lose the place either"
+        );
+    }
+
+    /// A row of a list that the reader can see, and so could have clicked.
+    ///
+    /// Measured in the list's own coordinates, so "visible" means inside the window the
+    /// adjustment is showing rather than merely realised: a list keeps widgets for rows
+    /// a little beyond its edges, and clicking one of those is not something a reader
+    /// can do.
+    fn visible_row(list: &gtk::Widget, adjustment: &gtk::Adjustment) -> Option<gtk::Widget> {
+        let mut rows = Vec::new();
+        let mut stack = vec![list.clone()];
+
+        while let Some(node) = stack.pop() {
+            let named = node.type_().name();
+            let visible = || {
+                node.compute_bounds(list).is_some_and(|bounds| {
+                    f64::from(bounds.y()) >= adjustment.value()
+                        && f64::from(bounds.y() + bounds.height())
+                            <= adjustment.value() + adjustment.page_size()
+                })
+            };
+            if (named.contains("ColumnViewRow") || named.contains("ListItem")) && visible() {
+                rows.push(node.clone());
+            }
+            let mut child = node.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                stack.push(widget);
+            }
+        }
+
+        rows.get(rows.len() / 2).cloned()
+    }
+
+    /// The regression the redraw guard did not cover: scrolling was kept, but clicking a
+    /// row and then waiting for a refresh threw the reader somewhere else entirely.
+    ///
+    /// A click focuses that row's widget. Rebuilding the view destroyed the focused row,
+    /// and the focus GTK then found put the list wherever that widget was — which is why
+    /// the view, its model and its rows are all kept rather than rebuilt.
+    #[allow(clippy::float_cmp)]
+    fn a_click_survives_a_refresh(window: &LaveWindow) {
+        window.apply_snapshot(snapshot_of(60, 1_000_000));
+
+        let listing = NodeId::Containers;
+        let tab = window.detail_tab(&listing);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.set_default_size(1000, 500);
+        window.present();
+        window.render_detail();
+        settle();
+
+        let surface = window
+            .detail_tab_for(&listing)
+            .expect("the containers listing has a tab")
+            .surface;
+        let scroller = descendant::<gtk::ScrolledWindow>(&surface.lead, |_| true)
+            .expect("the listing's table scrolls");
+        let adjustment = scroller.vadjustment();
+        adjustment.set_value(200.0);
+        settle();
+
+        // What GTK's own click gesture does to the row it lands on.
+        let view = descendant::<gtk::ColumnView>(&surface.lead, |_| true).expect("a table");
+        let clicked = visible_row(&view.clone().upcast(), &adjustment).expect("rows are on screen");
+        clicked.grab_focus();
+        let _ = clicked.activate_action("listitem.select", Some(&(false, false).to_variant()));
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            200.0,
+            "clicking a row the reader can see does not move the list"
+        );
+
+        window.apply_stats(snapshot_of(60, 800_000_000).stats);
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            200.0,
+            "a refresh after a click must not move the list either"
+        );
+        assert_eq!(
+            gtk::prelude::RootExt::focus(window).as_ref(),
+            Some(&clicked),
+            "the row that was clicked still has the focus: it was never destroyed"
+        );
+    }
+
+    /// Sorting by a column whose figures move used to come free, because the whole model
+    /// was replaced on every refresh. It is asked for now, and must still happen.
+    fn a_table_sorted_by_a_live_column_reorders_as_the_figures_move(window: &LaveWindow) {
+        let heaviest = |window: &LaveWindow, listing: &NodeId| {
+            let surface = window
+                .detail_tab_for(listing)
+                .expect("the containers listing has a tab")
+                .surface;
+            descendant::<gtk::ColumnView>(&surface.lead, |_| true)
+                .and_then(|view| view.model())
+                .and_then(|model| model.item(0))
+                .and_downcast::<crate::table_view::TableRowObject>()
+                .and_then(|row| row.key())
+        };
+
+        let mut snapshot = snapshot_of(60, 1_000_000);
+        snapshot.stats.insert(lave_core::engine::ContainerStats {
+            id: "c007".to_owned(),
+            memory_usage: 7_000_000_000,
+            memory_limit: 8_000_000_000,
+        });
+        window.apply_snapshot(snapshot);
+
+        let listing = NodeId::Containers;
+        let tab = window.detail_tab(&listing);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.present();
+        window.render_detail();
+        settle();
+
+        // Heaviest first, sorted the way the reader sorts it: by clicking the heading.
+        let surface = window
+            .detail_tab_for(&listing)
+            .expect("the containers listing has a tab")
+            .surface;
+        let view = descendant::<gtk::ColumnView>(&surface.lead, |_| true).expect("a table");
+        let memory = view
+            .columns()
+            .iter::<glib::Object>()
+            .flatten()
+            .filter_map(|object| object.downcast::<gtk::ColumnViewColumn>().ok())
+            .find(|column| column.title().is_some_and(|title| title == "Memory"))
+            .expect("the containers table has a Memory column");
+        view.sort_by_column(Some(&memory), gtk::SortType::Descending);
+        settle();
+        assert_eq!(
+            heaviest(window, &listing),
+            Some(NodeId::Container("c007".to_owned())),
+            "the heaviest container sorts to the top"
+        );
+
+        // The figures move: another container is now the heaviest.
+        let mut moved = snapshot_of(60, 1_000_000).stats;
+        moved.insert(lave_core::engine::ContainerStats {
+            id: "c042".to_owned(),
+            memory_usage: 7_500_000_000,
+            memory_limit: 8_000_000_000,
+        });
+        window.apply_stats(moved);
+        settle();
+        assert_eq!(
+            heaviest(window, &listing),
+            Some(NodeId::Container("c042".to_owned())),
+            "and the order follows them"
+        );
+    }
+
+    /// The ticks live in the window, not in the rows, so a table that is no longer
+    /// rebuilt has to be told when they change.
+    fn checking_every_row_shows_the_ticks(window: &LaveWindow) {
+        window.apply_snapshot(snapshot_of(60, 1_000_000));
+
+        let listing = NodeId::Containers;
+        let tab = window.detail_tab(&listing);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.present();
+        window.render_detail();
+        settle();
+
+        let surface = window
+            .detail_tab_for(&listing)
+            .expect("the containers listing has a tab")
+            .surface;
+        let ticked = || {
+            let mut found = 0;
+            let mut stack = vec![surface.lead.clone().upcast::<gtk::Widget>()];
+            while let Some(node) = stack.pop() {
+                if let Some(check) = node.downcast_ref::<gtk::CheckButton>()
+                    && check.is_active()
+                {
+                    found += 1;
+                }
+                let mut child = node.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    stack.push(widget);
+                }
+            }
+            found
+        };
+
+        assert_eq!(ticked(), 0, "nothing is checked to begin with");
+
+        window.set_all_checked(true);
+        settle();
+        assert!(
+            ticked() > 1,
+            "checking every row must show in the rows, not only in the strip above them"
+        );
+
+        window.set_all_checked(false);
+        settle();
+        assert_eq!(ticked(), 0, "and unchecking must clear them again");
+    }
+
+    /// A container's own page has no table: it is groups of properties, and they scroll
+    /// in the lower half. That is the panel a container is read in.
+    #[allow(clippy::float_cmp)]
+    fn a_containers_page_keeps_its_place_across_a_refresh(window: &LaveWindow) {
+        window.apply_snapshot(snapshot_of(60, 1_000_000));
+
+        let object = NodeId::Container("c007".to_owned());
+        let tab = window.detail_tab(&object);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.set_default_size(1000, 400);
+        window.present();
+        window.render_detail();
+        settle();
+
+        let surface = window
+            .detail_tab_for(&object)
+            .expect("the container has a tab")
+            .surface;
+        let scroller = surface
+            .paned
+            .end_child()
+            .and_downcast::<gtk::ScrolledWindow>()
+            .expect("the lower half scrolls");
+        let adjustment = scroller.vadjustment();
+        assert!(
+            adjustment.upper() > adjustment.page_size() + 50.0,
+            "the page must be taller than the pane: upper {} page {}",
+            adjustment.upper(),
+            adjustment.page_size()
+        );
+
+        let target = (adjustment.upper() - adjustment.page_size()).min(120.0);
+        adjustment.set_value(target);
+        settle();
+        assert_eq!(adjustment.value(), target, "the reader scrolled down");
+
+        window.apply_stats(snapshot_of(60, 900_000_000).stats);
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            target,
+            "a sample must not throw the reader back to the top"
+        );
+
+        window.apply_snapshot(snapshot_of(60, 500_000_000));
+        settle();
+        assert_eq!(adjustment.value(), target, "nor must a snapshot");
+
+        // Nor two of them landing before GTK has laid the first out.
+        window.apply_stats(snapshot_of(60, 700_000_000).stats);
+        window.apply_stats(snapshot_of(60, 300_000_000).stats);
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            target,
+            "two redraws in a turn must not lose the place either"
+        );
+
+        // Last, since clicking a row moves the page to it: a selectable value takes the
+        // focus, and a scroller scrolls to keep a focused widget in view — so a redraw
+        // that destroyed it left the page wherever the new focus landed.
+        if let Some(row) =
+            descendant::<adw::ActionRow>(&surface.body, gtk::prelude::WidgetExt::is_mapped)
+        {
+            row.grab_focus();
+            settle();
+            let after_click = adjustment.value();
+
+            window.apply_stats(snapshot_of(60, 400_000_000).stats);
+            settle();
+            assert_eq!(
+                adjustment.value(),
+                after_click,
+                "a refresh after a click must not move the page either"
+            );
+        }
+    }
+
+    /// The daemon as the reader actually has it: two containers running, two stopped,
+    /// disk usage accounted for and the daemon with something to say for itself.
+    fn daemon_snapshot(usage: i64) -> Snapshot {
+        let mut containers = Vec::new();
+        let mut stats = StatsIndex::new();
+        for index in 0..4 {
+            let id = format!("d{index:03}");
+            let running = index < 2;
+            containers.push(ContainerSummary {
+                id: id.clone(),
+                names: vec![format!("service-{index:03}")],
+                image: "nginx:1.27".to_owned(),
+                state: if running {
+                    ContainerState::Running
+                } else {
+                    ContainerState::Exited
+                },
+                ..ContainerSummary::default()
+            });
+            if running {
+                stats.insert(lave_core::engine::ContainerStats {
+                    id,
+                    memory_usage: usage,
+                    memory_limit: 8_000_000_000,
+                });
+            }
+        }
+
+        let category = |size: i64| {
+            Some(lave_core::engine::DiskCategory {
+                total_count: 4,
+                active_count: 2,
+                size,
+                reclaimable: size / 4,
+            })
+        };
+
+        Snapshot {
+            resolved: lave_core::endpoint::Resolved {
+                endpoint: lave_core::endpoint::Endpoint::Unix("/var/run/docker.sock".into()),
+                source: lave_core::endpoint::EndpointSource::RootfulSocket,
+            },
+            environment: lave_core::engine::EnvironmentSummary {
+                name: "workshop".to_owned(),
+                server_version: "27.3.1".to_owned(),
+                api_version: "1.47".to_owned(),
+                min_api_version: Some("1.24".to_owned()),
+                os_type: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                operating_system: "Debian GNU/Linux 13 (trixie)".to_owned(),
+                kernel_version: "6.12.101".to_owned(),
+                storage_driver: "overlay2".to_owned(),
+                logging_driver: "json-file".to_owned(),
+                cgroup_version: "2".to_owned(),
+                cgroup_driver: "systemd".to_owned(),
+                rootless: false,
+                cpus: 16,
+                memory_total: 32_000_000_000,
+                docker_root_dir: "/var/lib/docker".to_owned(),
+                containers_total: 4,
+                containers_running: 2,
+                containers_paused: 0,
+                containers_stopped: 2,
+                images: 12,
+                security_options: vec!["apparmor".to_owned(), "seccomp".to_owned()],
+                warnings: vec!["No swap limit support".to_owned()],
+            },
+            images: Vec::new(),
+            containers,
+            layers: LayerIndex::new(),
+            stats,
+            disk: lave_core::engine::DiskUsage {
+                images: category(9_000_000_000),
+                containers: category(400_000_000),
+                volumes: category(2_000_000_000),
+                build_cache: category(1_500_000_000),
+            },
+        }
+    }
+
+    /// The reader's report, acted out: the daemon's own page, scrolled down, a value
+    /// clicked into — and then the redraws that arrive every few seconds.
+    ///
+    /// Clicking a value is not clicking a row: a selectable subtitle is its own focusable
+    /// widget. A redraw that has to build the lower half again takes that widget with it,
+    /// and GTK hands the focus to whatever it finds instead, which is a row at the top.
+    /// The viewport inside a scroller follows the focus — so from that moment the page is
+    /// dragged back to the top on every layout, however often the reader scrolls down
+    /// again. That last part is what they noticed most.
+    #[allow(clippy::float_cmp)]
+    fn a_selected_value_survives_a_refresh(window: &LaveWindow) {
+        window.apply_snapshot(daemon_snapshot(1_000_000));
+
+        let root = NodeId::Root;
+        let tab = window.detail_tab(&root);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.set_default_size(1400, 900);
+        window.present();
+        window.render_detail();
+        settle();
+
+        let surface = window
+            .detail_tab_for(&root)
+            .expect("the daemon has a tab")
+            .surface;
+        let scroller = surface
+            .paned
+            .end_child()
+            .and_downcast::<gtk::ScrolledWindow>()
+            .expect("the lower half scrolls");
+        let adjustment = scroller.vadjustment();
+        assert!(
+            adjustment.upper() > adjustment.page_size() + 100.0,
+            "the daemon's page must be taller than the pane: upper {} page {}",
+            adjustment.upper(),
+            adjustment.page_size()
+        );
+
+        // The value the reader clicks into, and the widget that click lands in.
+        let row = descendant::<adw::ActionRow>(&surface.body, |row| row.title() == "Memory in use")
+            .expect("the footprint group states the memory in use");
+        let value = descendant::<gtk::Label>(&row, |label: &gtk::Label| label.is_selectable())
+            .expect("the value is selectable, so it can be copied");
+
+        // Scrolled to where the reader would be to click it: the row is on screen, so
+        // clicking it moves nothing by itself.
+        let top = row
+            .compute_bounds(&surface.body)
+            .map(|bounds| f64::from(bounds.y()))
+            .expect("the row is laid out");
+        let target = (top - 60.0)
+            .max(0.0)
+            .min(adjustment.upper() - adjustment.page_size());
+        adjustment.set_value(target);
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            target,
+            "the reader scrolled to the value"
+        );
+
+        value.grab_focus();
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            target,
+            "clicking a value already on screen does not move the page"
+        );
+
+        // The samples that arrive in between, which change the value but not the page.
+        window.apply_snapshot(daemon_snapshot(900_000_000));
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            target,
+            "a sample after the click must not throw the reader back"
+        );
+
+        // And the redraw that does have to build the lower half again: the daemon has
+        // begun reporting something it was not reporting before, so the page is a
+        // different shape and its widgets cannot be kept.
+        let mut reshaped = daemon_snapshot(800_000_000);
+        reshaped
+            .environment
+            .security_options
+            .push("userns".to_owned());
+        window.apply_snapshot(reshaped.clone());
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            target,
+            "a redraw that rebuilds the lower half must still leave the reader where \
+             they were"
+        );
+
+        // The focus must be back in the value the reader clicked, and not on a row at
+        // the top: a scroller keeps its focused child in view, and a focus at the top is
+        // what drags the page up again on every layout from then on.
+        let focused = gtk::prelude::RootExt::focus(window).expect("something has the focus");
+        let clicked =
+            descendant::<adw::ActionRow>(&surface.body, |row| row.title() == "Memory in use")
+                .expect("the row was built again")
+                .upcast::<gtk::Widget>();
+        let inside = std::iter::successors(Some(focused.clone()), gtk::prelude::WidgetExt::parent)
+            .any(|widget| widget == clicked);
+        assert!(
+            inside,
+            "the focus belongs in the row the reader clicked, not wherever GTK put it: \
+             it is on a {}",
+            focused.type_().name()
+        );
+
+        // And the part the reader noticed most: scrolling down again, and being thrown
+        // back up by the next redraw that touches nothing at all.
+        adjustment.set_value(target);
+        settle();
+        for usage in [700_000_000_i64, 600_000_000] {
+            let mut later = daemon_snapshot(usage);
+            later
+                .environment
+                .security_options
+                .clone_from(&reshaped.environment.security_options);
+            window.apply_snapshot(later);
+            settle();
+            assert_eq!(
+                adjustment.value(),
+                target,
+                "and every refresh after it must leave the reader alone too"
+            );
+        }
+    }
+
+    /// The other half of the same story: the row the reader had clicked into is not on
+    /// the page at all any more, so there is nothing to give the focus back to.
+    ///
+    /// It is given to nothing, deliberately. Left where GTK puts it when the widget under
+    /// it goes, the focus is on a row at the top, and the scroller follows it there.
+    #[allow(clippy::float_cmp)]
+    fn a_value_that_goes_away_does_not_take_the_page_with_it(window: &LaveWindow) {
+        window.apply_snapshot(daemon_snapshot(1_000_000));
+
+        let root = NodeId::Root;
+        let tab = window.detail_tab(&root);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.set_default_size(1400, 900);
+        window.present();
+        window.render_detail();
+        settle();
+
+        let surface = window
+            .detail_tab_for(&root)
+            .expect("the daemon has a tab")
+            .surface;
+        let scroller = surface
+            .paned
+            .end_child()
+            .and_downcast::<gtk::ScrolledWindow>()
+            .expect("the lower half scrolls");
+        let adjustment = scroller.vadjustment();
+
+        // A row that exists only while the daemon itemises its disk usage.
+        let row = descendant::<adw::ActionRow>(&surface.body, |row| row.title() == "Total on disk")
+            .expect("the footprint group totals the disk");
+        let value = descendant::<gtk::Label>(&row, |label: &gtk::Label| label.is_selectable())
+            .expect("the value is selectable, so it can be copied");
+
+        let top = row
+            .compute_bounds(&surface.body)
+            .map(|bounds| f64::from(bounds.y()))
+            .expect("the row is laid out");
+        let target = (top - 60.0)
+            .max(0.0)
+            .min(adjustment.upper() - adjustment.page_size());
+        adjustment.set_value(target);
+        value.grab_focus();
+        settle();
+
+        // Where the reader is once the row is on screen and clicked into. That is what
+        // the redraw below must not disturb.
+        let target = adjustment.value();
+        assert!(target > 0.0, "the reader is not at the top to begin with");
+
+        // The daemon stops accounting for the disk, and takes five rows with it.
+        let mut without = daemon_snapshot(900_000_000);
+        without.disk = lave_core::engine::DiskUsage::default();
+        window.apply_snapshot(without);
+        settle();
+
+        let reachable = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        assert_eq!(
+            adjustment.value(),
+            target.min(reachable),
+            "a shorter page leaves the reader as near where they were as it can, and \
+             not at the top"
+        );
+    }
+
+    /// The sidebar is a listing too, and the snapshot that redraws it arrives every few
+    /// seconds. Expanding a branch and reading down it must survive one.
+    #[allow(clippy::float_cmp)]
+    fn the_sidebar_keeps_its_place_across_a_refresh(window: &LaveWindow) {
+        window.apply_snapshot(snapshot_of(60, 1_000_000));
+        window.expand_all();
+        settle();
+
+        let adjustment = window
+            .imp()
+            .tree_view
+            .vadjustment()
+            .expect("the tree scrolls");
+        assert!(
+            adjustment.upper() > adjustment.page_size() + 100.0,
+            "sixty containers must overflow the sidebar: upper {} page {}",
+            adjustment.upper(),
+            adjustment.page_size()
+        );
+
+        adjustment.set_value(150.0);
+        settle();
+        assert_eq!(adjustment.value(), 150.0, "the reader scrolled down");
+
+        // Nothing has come or gone: the same objects, with figures that have moved.
+        window.apply_snapshot(snapshot_of(60, 900_000_000));
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            150.0,
+            "a refresh must leave the sidebar where the reader put it"
+        );
+
+        // And the same again once the reader has clicked one of the rows, which is what
+        // puts the focus inside the list.
+        let clicked = visible_row(&window.imp().tree_view.clone().upcast(), &adjustment)
+            .expect("rows are on screen");
+        clicked.grab_focus();
+        let _ = clicked.activate_action("listitem.select", Some(&(false, false).to_variant()));
+        settle();
+        let after_click = adjustment.value();
+
+        window.apply_snapshot(snapshot_of(60, 500_000_000));
+        settle();
+        assert_eq!(
+            adjustment.value(),
+            after_click,
+            "a refresh after a click must leave the sidebar alone too"
+        );
+    }
+
     /// A snapshot of one running container, with whatever memory figure is given.
     fn snapshot_holding(usage: i64) -> Snapshot {
         let container = ContainerSummary {
@@ -3162,6 +4105,13 @@ mod tests {
             "an identical page must not be rebuilt"
         );
 
+        let reading = || {
+            descendant::<adw::ActionRow>(&surface.body, |row| row.title() == "In use")
+                .and_then(|row| row.subtitle())
+                .map(|value| value.to_string())
+        };
+        let was = reading().expect("the memory row is on the page");
+
         let mut moved = StatsIndex::new();
         moved.insert(lave_core::engine::ContainerStats {
             id: "held".to_owned(),
@@ -3169,10 +4119,18 @@ mod tests {
             memory_limit: 8_000_000_000,
         });
         window.apply_stats(moved);
-        assert_ne!(
+
+        // Written into the row rather than drawn again: the widgets are what the reader
+        // has their place in, their click on, and their focus in.
+        assert_eq!(
             surface.body.first_child().as_ref(),
             Some(&before),
-            "a figure that has moved must reach the screen"
+            "a page of the same shape is not rebuilt for a figure that moved"
+        );
+        assert_ne!(
+            reading(),
+            Some(was),
+            "and the figure that moved must still reach the screen"
         );
     }
 }
