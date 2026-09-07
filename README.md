@@ -15,6 +15,16 @@ Provides:
 
 This tool is pretty much pure vibe-coded with Claude Code to scratch my own itch!
 
+# Installing
+
+For Debian Trixie you can download the `.deb` from the 
+[releases page](https://github.com/dcminter/lave-station/releases) and install it
+with `apt`, which will pull in the GTK and libadwaita runtime for you:
+
+```
+sudo apt install ./lave-station_0.1.0-1_amd64.deb
+```
+
 # Building and running
 
 Build prerequisites (Debian 13):
@@ -85,19 +95,35 @@ mount is read-only and the mount only exists while the application is running.
 Image (rather than container) browsing is managed entirely within the app because it needs
 a stand-in container for any filesystem to exist.
 
-## Installing for a test run
+## Building the package yourself
 
-To get the icon and launcher association working:
+Packaging is done by [`cargo-deb`](https://github.com/kornelski/cargo-deb) from the
+`[package.metadata.deb]` section of `crates/lave/Cargo.toml` — there is no Makefile and
+no `debian/` directory to keep in step:
 
 ```
-install -Dm644 crates/lave/data/com.paperstack.LaveStation.desktop \
-  ~/.local/share/applications/com.paperstack.LaveStation.desktop
-install -Dm644 crates/lave/data/icons/hicolor/scalable/apps/com.paperstack.LaveStation.svg \
-  ~/.local/share/icons/hicolor/scalable/apps/com.paperstack.LaveStation.svg
-gtk4-update-icon-cache -f -t ~/.local/share/icons/hicolor
+cargo install cargo-deb
+cargo deb -p lave           # writes target/debian/lave-station_<version>-1_<arch>.deb
 ```
 
-The `Exec=lave` line assumes the binary is on your `PATH`.
+No maintainer scripts are involved: the dpkg triggers owned by `libglib2.0-0t64` and
+`hicolor-icon-theme` compile the settings schema and refresh the icon cache once the
+files land.
+
+## Releasing
+
+`.github/workflows/deb.yml` builds and tests the package on a `debian:trixie` container
+for every push, and installs the result to prove the package works before keeping it.
+Pushing a `v*` tag attaches the `.deb` to a GitHub release of the same name:
+
+```
+git tag -a v0.1.0 -m "Lave Station 0.1.0"
+git push origin v0.1.0
+```
+
+Bump `version` in the workspace `Cargo.toml` and add a `<release>` to
+`crates/lave/data/com.paperstack.LaveStation.metainfo.xml` before tagging; the Debian
+version is taken from the crate version, with a `-1` revision.
 
 # Testing
 

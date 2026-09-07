@@ -3,6 +3,11 @@ name = "lave"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "A GTK interface to the Docker daemon on the local machine"
+license = "MIT"
+homepage = "https://github.com/dcminter/lave-station"
+repository = "https://github.com/dcminter/lave-station"
+authors = ["Dave Minter <dave@paperstack.com>"]
 
 [dependencies]
 lave-core = { path = "../lave-core" }
@@ -31,3 +36,35 @@ glib-build-tools = "0.22"
 
 [lints]
 workspace = true
+
+# --- Debian packaging (cargo-deb) ---------------------------------------------
+#
+# `cargo deb -p lave` builds target/debian/lave-station_<version>-1_<arch>.deb.
+#
+# No maintainer scripts are needed: dpkg triggers owned by libglib2.0-0t64 and
+# hicolor-icon-theme recompile the settings schema and the icon cache when the
+# files below land in their directories.
+[package.metadata.deb]
+name = "lave-station"
+maintainer = "Dave Minter <dave@paperstack.com>"
+copyright = "2026, Dave Minter <dave@paperstack.com>"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+extended-description = """\
+Lave Station is a GTK4 interface to the Docker daemon on the local machine. It \
+speaks the daemon's API directly rather than driving the command line client, \
+listing images and containers, reporting the local Docker environment, and \
+staying current by subscribing to the daemon's event stream."""
+# $auto resolves the GTK/libadwaita/glib shared libraries from the built binary.
+depends = "$auto"
+recommends = "docker.io | docker-ce"
+assets = [
+    ["target/release/lave", "usr/bin/", "755"],
+    ["data/com.paperstack.LaveStation.desktop", "usr/share/applications/", "644"],
+    ["data/com.paperstack.LaveStation.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["data/com.paperstack.LaveStation.gschema.xml", "usr/share/glib-2.0/schemas/", "644"],
+    ["data/icons/hicolor/scalable/apps/com.paperstack.LaveStation.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["data/icons/hicolor/symbolic/apps/com.paperstack.LaveStation-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/", "644"],
+    ["../../README.md", "usr/share/doc/lave-station/README.md", "644"],
+]

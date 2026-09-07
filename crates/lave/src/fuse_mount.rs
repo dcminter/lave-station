@@ -123,7 +123,18 @@ fn mount_root() -> Option<PathBuf> {
 }
 
 fn mount_point(label: &str, container_id: &str) -> Result<PathBuf, String> {
-    let root = mount_root().ok_or_else(|| {
+    mount_point_under(mount_root(), label, container_id)
+}
+
+// Split from mount_point so the naming rules can be tested without a session runtime
+// directory: CI containers have no XDG_RUNTIME_DIR, and edition 2024 makes setting one
+// from a test `unsafe`, which this crate forbids.
+fn mount_point_under(
+    root: Option<PathBuf>,
+    label: &str,
+    container_id: &str,
+) -> Result<PathBuf, String> {
+    let root = root.ok_or_else(|| {
         "XDG_RUNTIME_DIR is not set, so there is nowhere private to mount".to_owned()
     })?;
 
@@ -503,10 +514,17 @@ mod tests {
 
     use super::*;
 
+    /// A stand-in for the session runtime directory, so these tests do not depend on
+    /// the environment they run under.
+    fn fake_root() -> PathBuf {
+        PathBuf::from("/run/user/1000").join(MOUNT_DIR)
+    }
+
     #[test]
     fn a_mount_point_cannot_escape_the_runtime_directory() {
         // A container may be named anything; the path must stay a single component.
-        let point = mount_point("../../etc/passwd", "abcdef123456").expect("a path");
+        let point = mount_point_under(Some(fake_root()), "../../etc/passwd", "abcdef123456")
+            .expect("a path");
 
         let name = point
             .file_name()
@@ -515,14 +533,26 @@ mod tests {
         assert!(!name.contains('/'), "got {name}");
         assert!(!name.contains(".."), "got {name}");
         assert!(name.ends_with("-abcdef123456"));
+        assert!(
+            point.starts_with("/run/user/1000"),
+            "escaped the root: {}",
+            point.display()
+        );
     }
 
     #[test]
     fn the_mount_point_is_unique_per_container() {
-        let first = mount_point("web", "aaaaaaaaaaaa").expect("a path");
-        let second = mount_point("web", "bbbbbbbbbbbb").expect("a path");
+        let first = mount_point_under(Some(fake_root()), "web", "aaaaaaaaaaaa").expect("a path");
+        let second = mount_point_under(Some(fake_root()), "web", "bbbbbbbbbbbb").expect("a path");
 
         assert_ne!(first, second, "two containers must not share a mount point");
+    }
+
+    #[test]
+    fn a_session_with_no_runtime_directory_is_refused_rather_than_guessed_at() {
+        let refusal = mount_point_under(None, "web", "aaaaaaaaaaaa").expect_err("a refusal");
+
+        assert!(refusal.contains("XDG_RUNTIME_DIR"), "got {refusal}");
     }
 
     #[test]
