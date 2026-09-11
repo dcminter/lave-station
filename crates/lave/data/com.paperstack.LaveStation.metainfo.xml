@@ -38,6 +38,12 @@
   </categories>
 
   <releases>
+    <release version="0.2.0" date="2026-09-11">
+      <description>
+        <p>The sidebar can be folded away, from the header bar or with F9, to give the
+        detail pane the whole window. Its visibility is remembered. Minor fixes.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-08-01">
       <description>
         <p>First iteration: the window, the tree of images and containers, and the

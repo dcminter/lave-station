@@ -17,6 +17,7 @@ use lave_core::settings::{ColumnWidths, Settings};
 const SCHEMA_ID: &str = "com.paperstack.LaveStation";
 
 const SIDEBAR_WIDTH: &str = "sidebar-width";
+const SIDEBAR_VISIBLE: &str = "sidebar-visible";
 const SHOW_STOPPED: &str = "show-stopped-containers";
 const SHOW_UNTAGGED: &str = "show-untagged-images";
 const COLUMN_WIDTHS: &str = "column-widths";
@@ -59,6 +60,7 @@ impl Prefs {
 
         Settings {
             sidebar_width: settings.int(SIDEBAR_WIDTH),
+            sidebar_visible: settings.boolean(SIDEBAR_VISIBLE),
             show_stopped_containers: settings.boolean(SHOW_STOPPED),
             show_untagged_images: settings.boolean(SHOW_UNTAGGED),
             column_widths: read_widths(settings),
@@ -77,6 +79,10 @@ impl Prefs {
         report(
             SIDEBAR_WIDTH,
             store.set_int(SIDEBAR_WIDTH, settings.sidebar_width),
+        );
+        report(
+            SIDEBAR_VISIBLE,
+            store.set_boolean(SIDEBAR_VISIBLE, settings.sidebar_visible),
         );
         report(
             SHOW_STOPPED,
@@ -192,6 +198,8 @@ mod tests {
 
         let stored = Settings {
             sidebar_width: 421,
+            // Not the default, so the round trip proves it was stored.
+            sidebar_visible: false,
             show_stopped_containers: false,
             show_untagged_images: false,
             column_widths: ColumnWidths::from([

@@ -27,6 +27,8 @@ pub type ColumnWidths = BTreeMap<String, BTreeMap<String, i32>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub sidebar_width: i32,
+    /// Whether the sidebar is shown. Hiding it keeps its width for when it returns.
+    pub sidebar_visible: bool,
     /// Whether the container tables include the ones that are not running. One answer for
     /// both pages that list containers, since it is one question.
     pub show_stopped_containers: bool,
@@ -44,6 +46,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_visible: true,
             // Both tables open onto the working set: the containers actually executing,
             // and the images still named by a tag. Neither hides anything the user
             // cannot see: the toggle above each table says how many rows the other view
@@ -131,6 +134,7 @@ mod tests {
         let settings = Settings::default();
 
         assert_eq!(settings.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+        assert!(settings.sidebar_visible, "the sidebar opens shown");
         // Running containers and tagged images: what is on the machine now, rather than
         // that plus everything left behind.
         assert!(!settings.show_stopped_containers);

@@ -22,7 +22,7 @@ For Debian Trixie you can download the `.deb` from the
 with `apt`, which will pull in the GTK and libadwaita runtime for you:
 
 ```
-sudo apt install ./lave-station_0.1.0-1_amd64.deb
+sudo apt install ./lave-station_0.2.0-1_amd64.deb
 ```
 
 # Building and running
@@ -50,7 +50,8 @@ Options: `--docker-host <URL>` overrides `DOCKER_HOST` and any active Docker con
 `--log-level <level>` sets verbosity, and `--no-indicator` suppresses the panel
 indicator.
 
-View preferences - the sidebar width, view toggles on lists, and table column widths
+View preferences - the sidebar width and whether it is shown (F9 or the header button
+toggles it), view toggles on lists, and table column widths
 are stored in GSettings under `com.paperstack.LaveStation`. Sort order is not stored
 beyond the session lifetime.
 
@@ -117,8 +118,8 @@ for every push, and installs the result to prove the package works before keepin
 Pushing a `v*` tag attaches the `.deb` to a GitHub release of the same name:
 
 ```
-git tag -a v0.1.0 -m "Lave Station 0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "Lave Station 0.2.0"
+git push origin v0.2.0
 ```
 
 Bump `version` in the workspace `Cargo.toml` and add a `<release>` to
