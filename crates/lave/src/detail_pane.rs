@@ -79,6 +79,10 @@ type RowShape = (String, Option<NodeId>);
 /// A group's title and the rows under it, by identity rather than by value.
 type GroupShape = (String, Vec<RowShape>);
 
+/// The select-all handler in force. Swappable, so the control's own connection can be
+/// made once and kept across the redraws that would otherwise stack another on it.
+type ToggleAll = Rc<RefCell<Rc<dyn Fn(bool)>>>;
+
 /// The lower half of a page, apart from the values a refresh moves.
 ///
 /// Two pages of the same shape are drawn by the same widgets: the values are written
@@ -171,6 +175,9 @@ pub struct Handlers {
     pub cog_ready: Rc<dyn Fn(gtk::MenuButton)>,
     /// Likewise the select-all control, whose own state is a summary of the row ticks.
     pub select_all_ready: Rc<dyn Fn(gtk::CheckButton)>,
+    /// Select-all was operated. Kept apart from `select_all_ready` because the control
+    /// outlives a redraw: its handler is connected once, and this is what it calls.
+    pub toggle_all: Rc<dyn Fn(bool)>,
     /// A button in the action strip was pressed, by index into the page's own actions.
     pub act: Rc<dyn Fn(usize)>,
 }
@@ -395,12 +402,15 @@ impl Surface {
         section
             .table
             .update(table, &state.sort, Some(handlers.table.clone()));
-        let (root, header) = (section.root.clone(), section.header.clone());
+        let root = section.root.clone();
 
-        // Put back before the strip is filled: doing that hands the window its select-all
-        // and its cog, and the window answers by asking this same table to redraw.
+        // Put back before the strip is brought up to date: doing that hands the window
+        // its select-all and its cog, and the window answers by asking this same table to
+        // redraw — which reads the section again.
         self.section.replace(Some(section));
-        fill_header(&header, detail, handlers);
+        if let Some(section) = self.section.borrow().as_ref() {
+            section.update_header(detail, handlers);
+        }
 
         root.upcast()
     }
@@ -595,12 +605,23 @@ fn action_button(offer: &Offer, index: usize, act: &Rc<dyn Fn(usize)>) -> gtk::B
 struct TableSection {
     /// What goes in the pane.
     root: gtk::Box,
-    /// Refilled on each redraw: what the strip holds describes the page, and it holds
-    /// nothing the reader can lose their place in.
-    header: gtk::Box,
     table: TableView,
     /// Built to lead, which is arranged differently from a table below the groups.
     leading: bool,
+    /// Built once and kept thereafter. A menu hangs off the cog, and destroying a button
+    /// takes its menu with it: rebuilding this strip on every refresh closed the menu
+    /// under the reader's pointer before they could choose anything from it.
+    select_all: gtk::CheckButton,
+    cog: gtk::MenuButton,
+    /// The count beside the table, hidden on a page that offers none.
+    summary: gtk::Label,
+    /// Holds the filter toggle, which is rebuilt only when the filter itself changes.
+    filter_slot: gtk::Box,
+    /// What the toggle in `filter_slot` was built from.
+    filter: RefCell<Option<TableFilter>>,
+    /// What select-all does now: the control's handler is connected once and reads this,
+    /// so a redraw can hand it new work without connecting a second handler.
+    toggle_all: ToggleAll,
 }
 
 impl TableSection {
@@ -619,6 +640,55 @@ impl TableSection {
             .spacing(6)
             .build();
         root.append(&header);
+
+        // Lines up with the column of row checkboxes below it, so what it governs is
+        // legible without a label. Its three states are the window's business.
+        let select_all = gtk::CheckButton::builder()
+            .tooltip_text("Check every row")
+            .valign(gtk::Align::Center)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        select_all.update_property(&[gtk::accessible::Property::Label("Check every row")]);
+        header.append(&select_all);
+
+        let toggle_all: ToggleAll = Rc::new(RefCell::new(Rc::clone(&handlers.toggle_all)));
+        select_all.connect_toggled({
+            let toggle_all = Rc::clone(&toggle_all);
+            move |check| {
+                // Taken out of the cell before it is called: what it does may well come
+                // back round to this same cell.
+                let act = Rc::clone(&toggle_all.borrow());
+                act(check.is_active());
+            }
+        });
+
+        // Insensitive until something is checked, which is the window's business: what is
+        // checked outlives this widget.
+        let cog = gtk::MenuButton::builder()
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Act on the checked rows")
+            .valign(gtk::Align::Center)
+            .build();
+        cog.add_css_class("flat");
+        cog.update_property(&[gtk::accessible::Property::Label("Act on the checked rows")]);
+        header.append(&cog);
+
+        let summary = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .margin_start(6)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        summary.add_css_class("dim-label");
+        header.append(&summary);
+
+        let filter_slot = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .halign(gtk::Align::End)
+            .hexpand(true)
+            .build();
+        header.append(&filter_slot);
 
         let view = TableView::new(table, &state.sort, &state.widths, handlers.table.clone());
 
@@ -643,58 +713,43 @@ impl TableSection {
 
         Self {
             root,
-            header,
             table: view,
             leading: detail.table_first,
+            select_all,
+            cog,
+            summary,
+            filter_slot,
+            filter: RefCell::new(None),
+            toggle_all,
         }
     }
-}
 
-/// The strip above a table: select-all and bulk actions on the left, the filter on the
-/// right.
-fn fill_header(header: &gtk::Box, detail: &DetailPage, handlers: &Handlers) {
-    table_view::clear(header);
+    /// Bring the strip above the table up to date for `detail`.
+    ///
+    /// Nothing here is rebuilt unless it has actually changed, because the reader may
+    /// have the cog's menu open over it.
+    fn update_header(&self, detail: &DetailPage, handlers: &Handlers) {
+        self.toggle_all.replace(Rc::clone(&handlers.toggle_all));
 
-    // Lines up with the column of row checkboxes below it, so what it governs is legible
-    // without a label. Its three states are the window's business.
-    let select_all = gtk::CheckButton::builder()
-        .tooltip_text("Check every row")
-        .valign(gtk::Align::Center)
-        .margin_start(6)
-        .margin_end(6)
-        .build();
-    select_all.update_property(&[gtk::accessible::Property::Label("Check every row")]);
-    header.append(&select_all);
-    (handlers.select_all_ready)(select_all);
+        // The window drives the sensitivity of these and fills the cog's menu in, and it
+        // is told afresh on each redraw which page's controls those are.
+        (handlers.select_all_ready)(self.select_all.clone());
+        (handlers.cog_ready)(self.cog.clone());
 
-    // Insensitive until something is checked, which is the window's business: what is
-    // checked outlives this widget.
-    let cog = gtk::MenuButton::builder()
-        .icon_name("emblem-system-symbolic")
-        .tooltip_text("Act on the checked rows")
-        .valign(gtk::Align::Center)
-        .build();
-    cog.add_css_class("flat");
-    cog.update_property(&[gtk::accessible::Property::Label("Act on the checked rows")]);
-    header.append(&cog);
-    (handlers.cog_ready)(cog);
+        let summary = detail.table_summary.as_deref().unwrap_or_default();
+        if self.summary.label() != summary {
+            self.summary.set_label(summary);
+        }
+        self.summary.set_visible(detail.table_summary.is_some());
 
-    if let Some(summary) = &detail.table_summary {
-        let label = gtk::Label::builder()
-            .label(summary)
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .margin_start(6)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
-        label.add_css_class("dim-label");
-        header.append(&label);
-    }
-
-    if let Some(filter) = &detail.table_filter {
-        let toggle = filter_toggle(filter, &handlers.set_filter);
-        toggle.set_hexpand(true);
-        header.append(&toggle);
+        if *self.filter.borrow() != detail.table_filter {
+            table_view::clear(&self.filter_slot);
+            if let Some(filter) = &detail.table_filter {
+                self.filter_slot
+                    .append(&filter_toggle(filter, &handlers.set_filter));
+            }
+            self.filter.replace(detail.table_filter.clone());
+        }
     }
 }
 

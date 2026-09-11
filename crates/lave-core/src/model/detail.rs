@@ -648,22 +648,36 @@ fn related_images_group(image: &ImageSummary, cx: &Context<'_>) -> Option<Detail
     (!rows.is_empty()).then(|| group("Related images", rows))
 }
 
+/// One row per mount rather than one long line of them all: the host side names the
+/// row, the path inside the container is its value, so the group reads as a table of
+/// what maps to what.
+fn storage_group(container: &ContainerSummary) -> DetailGroup {
+    if container.mounts.is_empty() {
+        return group("Storage", vec![row("Mounts", "none")]);
+    }
+
+    let rows = container
+        .mounts
+        .iter()
+        .map(|mount| {
+            row(
+                &text_or_unknown(&mount.source),
+                format!(
+                    "{}{}",
+                    text_or_unknown(&mount.destination),
+                    if mount.read_write { "" } else { " (read-only)" }
+                ),
+            )
+        })
+        .collect();
+
+    group("Storage", rows)
+}
+
 /// One container, with the image it runs and its siblings.
 #[must_use]
 pub fn container(container: &ContainerSummary, cx: &Context<'_>) -> DetailPage {
     let ports: Vec<String> = container.ports.iter().map(port).collect();
-    let mounts: Vec<String> = container
-        .mounts
-        .iter()
-        .map(|mount| {
-            format!(
-                "{} \u{2192} {}{}",
-                text_or_unknown(&mount.source),
-                text_or_unknown(&mount.destination),
-                if mount.read_write { "" } else { " (read-only)" }
-            )
-        })
-        .collect();
 
     let mut groups = vec![
         group(
@@ -692,7 +706,7 @@ pub fn container(container: &ContainerSummary, cx: &Context<'_>) -> DetailPage {
                 row("Networks", list_or_none(&container.networks)),
             ],
         ),
-        group("Storage", vec![row("Mounts", list_or_none(&mounts))]),
+        storage_group(container),
     ];
 
     if let Some(memory) = memory_group(container, cx) {
@@ -1672,8 +1686,8 @@ mod tests {
         );
         assert_eq!(page.value("Networking", "Networks"), Some("bridge"));
         assert_eq!(
-            page.value("Storage", "Mounts"),
-            Some("/srv/www \u{2192} /usr/share/nginx/html (read-only)")
+            page.value("Storage", "/srv/www"),
+            Some("/usr/share/nginx/html (read-only)")
         );
     }
 
@@ -1704,8 +1718,66 @@ mod tests {
         let page = container(&writable, &World::default().context());
 
         assert_eq!(
-            page.value("Storage", "Mounts"),
-            Some("/srv/www \u{2192} /usr/share/nginx/html")
+            page.value("Storage", "/srv/www"),
+            Some("/usr/share/nginx/html")
+        );
+    }
+
+    /// One line per mount, the host side naming the row and the container side its
+    /// value, so a container with a dozen mounts reads as a table rather than a
+    /// paragraph.
+    #[test]
+    fn each_mount_gets_a_row_of_its_own() {
+        let mut many = sample_container();
+        many.mounts = vec![
+            MountSummary {
+                kind: "bind".to_owned(),
+                source: "/srv/www".to_owned(),
+                destination: "/usr/share/nginx/html".to_owned(),
+                read_write: false,
+            },
+            MountSummary {
+                kind: "volume".to_owned(),
+                source: "/var/lib/docker/volumes/cache/_data".to_owned(),
+                destination: "/var/cache/nginx".to_owned(),
+                read_write: true,
+            },
+        ];
+
+        let page = container(&many, &World::default().context());
+        let storage = page
+            .groups
+            .iter()
+            .find(|group| group.title == "Storage")
+            .expect("the page has a Storage group");
+
+        let rows: Vec<(&str, &str)> = storage
+            .rows
+            .iter()
+            .map(|row| (row.label.as_str(), row.value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("/srv/www", "/usr/share/nginx/html (read-only)"),
+                ("/var/lib/docker/volumes/cache/_data", "/var/cache/nginx"),
+            ],
+            "each mount is its own row: source on the left, destination on the right"
+        );
+    }
+
+    /// A daemon that names no source still says where the mount lands, and the row is
+    /// found by its placeholder rather than going missing.
+    #[test]
+    fn a_mount_with_no_source_still_says_where_it_lands() {
+        let mut anonymous = sample_container();
+        anonymous.mounts[0].source = String::new();
+
+        let page = container(&anonymous, &World::default().context());
+
+        assert_eq!(
+            page.value("Storage", "unknown"),
+            Some("/usr/share/nginx/html (read-only)")
         );
     }
 

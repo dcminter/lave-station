@@ -857,18 +857,12 @@ impl LaveWindow {
         self.update_bulk_controls();
     }
 
-    /// Take charge of a freshly rendered select-all control.
+    /// Take charge of the select-all control on the page now showing.
+    ///
+    /// Its handler is not connected here: the control survives a redraw, so connecting on
+    /// each one would stack a second handler on the same button. See
+    /// [`detail_pane::Handlers::toggle_all`].
     fn adopt_select_all(&self, check: &gtk::CheckButton) {
-        check.connect_toggled(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |check| {
-                if !window.imp().syncing.get() {
-                    window.set_all_checked(check.is_active());
-                }
-            }
-        ));
-
         self.imp().select_all.replace(Some(check.clone()));
         self.update_bulk_controls();
     }
@@ -1947,6 +1941,16 @@ impl LaveWindow {
                 let window = self.clone();
                 Rc::new(move |check| window.adopt_select_all(&check))
             },
+            toggle_all: {
+                let window = self.clone();
+                Rc::new(move |on| {
+                    // Setting the control to match the ticks emits `toggled` too, and
+                    // that is the window's own doing rather than the reader's.
+                    if !window.imp().syncing.get() {
+                        window.set_all_checked(on);
+                    }
+                })
+            },
             table: TableHandlers {
                 activate: {
                     let window = self.clone();
@@ -2907,6 +2911,7 @@ mod tests {
         the_containers_panel_keeps_its_place_across_a_refresh(&window);
         a_click_survives_a_refresh(&window);
         checking_every_row_shows_the_ticks(&window);
+        an_open_cog_menu_survives_a_refresh(&window);
         a_table_sorted_by_a_live_column_reorders_as_the_figures_move(&window);
         the_sidebar_keeps_its_place_across_a_refresh(&window);
         a_containers_page_keeps_its_place_across_a_refresh(&window);
@@ -2987,6 +2992,7 @@ mod tests {
             set_filter: Rc::new(|_, _| {}),
             cog_ready: Rc::new(|_| {}),
             select_all_ready: Rc::new(|_| {}),
+            toggle_all: Rc::new(|_| {}),
             act: {
                 let chosen = Rc::clone(chosen);
                 Rc::new(move |index| chosen.set(Some(index)))
@@ -3637,6 +3643,67 @@ mod tests {
         window.set_all_checked(false);
         settle();
         assert_eq!(ticked(), 0, "and unchecking must clear them again");
+    }
+
+    /// Checking a handful of rows and then reaching for the cog takes longer than the
+    /// gap between refreshes. The strip above the table used to be rebuilt on every one
+    /// of them, and a menu hanging off a button that has been destroyed goes with it —
+    /// so the menu closed itself under the reader's pointer before they could click.
+    fn an_open_cog_menu_survives_a_refresh(window: &LaveWindow) {
+        window.apply_snapshot(snapshot_of(60, 1_000_000));
+
+        let listing = NodeId::Containers;
+        let tab = window.detail_tab(&listing);
+        window.imp().tab_view.set_selected_page(&tab);
+        window.present();
+        window.render_detail();
+        settle();
+
+        let surface = window
+            .detail_tab_for(&listing)
+            .expect("the containers listing has a tab")
+            .surface;
+
+        // The cog only acts on checked rows, and is insensitive until there are some.
+        window.set_all_checked(true);
+        settle();
+
+        let cog = descendant::<gtk::MenuButton>(&surface.lead, |_| true)
+            .expect("the strip above the table carries a cog");
+        assert!(
+            cog.is_sensitive(),
+            "checked rows give the cog something to do"
+        );
+
+        cog.popup();
+        settle();
+        let menu = cog
+            .popover()
+            .expect("the cog builds its menu when it opens");
+        assert!(menu.is_visible(), "the menu is up");
+
+        // A refresh of exactly the kind the daemon delivers several times a minute.
+        window.apply_snapshot(snapshot_of(60, 2_000_000));
+        settle();
+
+        assert_eq!(
+            cog.popover().as_ref(),
+            Some(&menu),
+            "a refresh must not swap the menu out from under the pointer"
+        );
+        assert!(
+            menu.is_visible(),
+            "a refresh must not close the menu before it can be clicked"
+        );
+        assert_eq!(
+            descendant::<gtk::MenuButton>(&surface.lead, |_| true).as_ref(),
+            Some(&cog),
+            "and the cog itself must be the same button, not a replacement"
+        );
+
+        menu.popdown();
+        window.set_all_checked(false);
+        settle();
     }
 
     /// A container's own page has no table: it is groups of properties, and they scroll
