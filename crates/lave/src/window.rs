@@ -78,6 +78,8 @@ mod imp {
         #[template_child]
         pub paned: TemplateChild<gtk::Paned>,
         #[template_child]
+        pub sidebar: TemplateChild<gtk::ScrolledWindow>,
+        #[template_child]
         pub window_title: TemplateChild<adw::WindowTitle>,
         #[template_child]
         pub content_stack: TemplateChild<gtk::Stack>,
@@ -272,6 +274,7 @@ impl LaveWindow {
         ));
 
         self.setup_actions();
+        self.setup_sidebar_toggle();
         self.setup_menu_dismissal();
         self.setup_tabs();
 
@@ -2264,8 +2267,53 @@ impl LaveWindow {
     }
 
     /// Remember where the user left the divider, alongside whatever else has changed.
+    ///
+    /// A hidden sidebar's divider says nothing about its width, so the width kept from
+    /// before it was hidden stands.
     pub fn store_sidebar_width(&self) {
-        self.imp().settings.borrow_mut().sidebar_width = self.imp().paned.position();
+        if self.imp().sidebar.get_visible() {
+            self.imp().settings.borrow_mut().sidebar_width = self.imp().paned.position();
+        }
+        self.store_settings();
+    }
+
+    /// The stateful `win.show-sidebar` action the header's toggle button and F9 drive.
+    fn setup_sidebar_toggle(&self) {
+        let visible = self.imp().settings.borrow().sidebar_visible;
+        self.imp().sidebar.set_visible(visible);
+
+        let action =
+            gtk::gio::SimpleAction::new_stateful("show-sidebar", None, &visible.to_variant());
+        action.connect_change_state(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |action, state| {
+                if let Some(visible) = state.and_then(glib::Variant::get::<bool>) {
+                    action.set_state(&visible.to_variant());
+                    window.set_sidebar_visible(visible);
+                }
+            }
+        ));
+        self.add_action(&action);
+    }
+
+    /// Show or hide the sidebar, keeping its width across the gap.
+    fn set_sidebar_visible(&self, visible: bool) {
+        let imp = self.imp();
+        if imp.sidebar.get_visible() == visible {
+            return;
+        }
+
+        if visible {
+            imp.sidebar.set_visible(true);
+            let width = imp.settings.borrow().sidebar_width;
+            imp.paned.set_position(width);
+        } else {
+            imp.settings.borrow_mut().sidebar_width = imp.paned.position();
+            imp.sidebar.set_visible(false);
+        }
+
+        imp.settings.borrow_mut().sidebar_visible = visible;
         self.store_settings();
     }
 
@@ -2906,6 +2954,7 @@ mod tests {
         a_listing_page_states_its_memory_total_beside_the_table();
         a_row_shows_its_value_verbatim_rather_than_as_markup();
         let window = detail_pages_get_a_tab_each_and_keep_it();
+        the_sidebar_folds_away_and_returns_at_its_width(&window);
         the_tab_menu_offers_only_what_it_can_close(&window);
         a_sample_that_says_nothing_new_does_not_rebuild_the_pane(&window);
         the_containers_panel_keeps_its_place_across_a_refresh(&window);
@@ -3272,6 +3321,38 @@ mod tests {
         assert!(window.detail_tab_for(&first).is_none());
 
         window
+    }
+
+    fn the_sidebar_folds_away_and_returns_at_its_width(window: &LaveWindow) {
+        // The window writes to the user's real store; put back what was there.
+        let original = window.imp().settings.borrow().clone();
+        let sidebar = window.imp().sidebar.clone();
+        let paned = window.imp().paned.clone();
+        let toggle = window
+            .lookup_action("show-sidebar")
+            .expect("the sidebar toggle is registered");
+        let state = || toggle.state().and_then(|state| state.get::<bool>());
+
+        window.set_sidebar_visible(true);
+        paned.set_position(345);
+
+        toggle.activate(None);
+        assert!(!sidebar.get_visible(), "the toggle hides the sidebar");
+        assert_eq!(state(), Some(false), "the button reads as off");
+        assert!(!window.imp().settings.borrow().sidebar_visible);
+
+        // Closing with it hidden must not record the collapsed divider as its width.
+        paned.set_position(0);
+        window.store_sidebar_width();
+        assert_eq!(window.imp().settings.borrow().sidebar_width, 345);
+
+        toggle.activate(None);
+        assert!(sidebar.get_visible(), "toggling again brings it back");
+        assert_eq!(state(), Some(true));
+        assert_eq!(paned.position(), 345, "at the width it had before");
+
+        window.imp().settings.replace(original.clone());
+        window.imp().prefs.store(&original);
     }
 
     /// Whether a tab command is offered right now.

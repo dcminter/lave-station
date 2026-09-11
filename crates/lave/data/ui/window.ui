@@ -62,6 +62,16 @@
                     <property name="title" translatable="yes">Lave Station</property>
                   </object>
                 </property>
+                <child type="start">
+                  <object class="GtkToggleButton" id="sidebar_button">
+                    <property name="icon-name">sidebar-show-symbolic</property>
+                    <property name="tooltip-text" translatable="yes">Show Sidebar (F9)</property>
+                    <property name="action-name">win.show-sidebar</property>
+                    <accessibility>
+                      <property name="label" translatable="yes">Show sidebar</property>
+                    </accessibility>
+                  </object>
+                </child>
                 <child type="end">
                   <object class="GtkMenuButton" id="menu_button">
                     <property name="icon-name">open-menu-symbolic</property>
@@ -84,7 +94,7 @@
                 <property name="shrink-start-child">false</property>
                 <property name="shrink-end-child">false</property>
                 <property name="start-child">
-                  <object class="GtkScrolledWindow">
+                  <object class="GtkScrolledWindow" id="sidebar">
                     <property name="hscrollbar-policy">never</property>
                     <property name="width-request">180</property>
                     <property name="child">

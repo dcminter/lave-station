@@ -131,6 +131,7 @@ fn setup_actions(application: &adw::Application) {
     ));
     application.add_action(&quit);
     application.set_accels_for_action("app.quit", &["<Control>q"]);
+    application.set_accels_for_action("win.show-sidebar", &["F9"]);
 
     let about = gtk::gio::SimpleAction::new("about", None);
     about.connect_activate(glib::clone!(

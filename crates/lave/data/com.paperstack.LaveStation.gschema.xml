@@ -13,6 +13,15 @@
       </description>
     </key>
 
+    <key name="sidebar-visible" type="b">
+      <default>true</default>
+      <summary>Show the object sidebar</summary>
+      <description>
+        Off when the user has folded the sidebar away to give the detail pane the whole
+        window. The width is kept regardless, so it returns as it was.
+      </description>
+    </key>
+
     <key name="show-stopped-containers" type="b">
       <default>false</default>
       <summary>Include stopped containers in the container tables</summary>
