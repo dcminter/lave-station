@@ -412,7 +412,7 @@ mod tests {
         engine.list_containers().await.expect("containers");
         engine.image_history("sha256:abc").await.expect("history");
 
-        assert!(engine.calls().is_empty());
+        assert_eq!(engine.calls(), []);
     }
 
     #[tokio::test]

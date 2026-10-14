@@ -1612,15 +1612,11 @@ mod tests {
 
         // A listing is a way of choosing something, not a thing to act on; the object's
         // own page is where its actions belong.
-        assert!(images(&world.context()).actions.is_empty());
-        assert!(containers(&world.context()).actions.is_empty());
+        assert_eq!(images(&world.context()).actions, []);
+        assert_eq!(containers(&world.context()).actions, []);
 
-        assert!(
-            !container(&sample_container(), &world.context())
-                .actions
-                .is_empty()
-        );
-        assert!(!image(&sample_image(), &world.context()).actions.is_empty());
+        assert_ne!(container(&sample_container(), &world.context()).actions, []);
+        assert_ne!(image(&sample_image(), &world.context()).actions, []);
     }
 
     #[test]

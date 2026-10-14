@@ -226,7 +226,7 @@ mod tests {
     fn a_line_split_across_chunks_is_rejoined() {
         let mut transcript = Transcript::default();
 
-        assert!(transcript.push(&out("half")).lines.is_empty());
+        assert_eq!(transcript.push(&out("half")).lines, []);
         let appended = transcript.push(&out(" of a line\n"));
 
         assert_eq!(texts(&appended), vec!["half of a line"]);
@@ -272,7 +272,7 @@ mod tests {
         let mut transcript = Transcript::default();
         transcript.push(&out("complete\n"));
 
-        assert!(transcript.finish().lines.is_empty());
+        assert_eq!(transcript.finish().lines, []);
     }
 
     #[test]
@@ -419,26 +419,26 @@ mod tests {
 
     #[test]
     fn plain_output_is_left_uncoloured() {
-        assert!(highlight("starting server on port 8080").is_empty());
+        assert_eq!(highlight("starting server on port 8080"), []);
         // Mentioning a brace is not the same as being JSON.
-        assert!(highlight("config {broken").is_empty());
+        assert_eq!(highlight("config {broken"), []);
     }
 
     #[test]
     fn a_half_written_line_is_left_alone_rather_than_half_coloured() {
         // A container flushing mid-write produces exactly this.
-        assert!(highlight(r#"{"level":"info","msg":"partial"#).is_empty());
+        assert_eq!(highlight(r#"{"level":"info","msg":"partial"#), []);
     }
 
     #[test]
     fn a_json_array_is_not_treated_as_a_structured_line() {
         // Structured logging is objects; a bare array is far more likely to be prose.
-        assert!(highlight("[1, 2, 3]").is_empty());
+        assert_eq!(highlight("[1, 2, 3]"), []);
     }
 
     #[test]
     fn leading_whitespace_does_not_stop_a_line_being_recognised() {
-        assert!(!highlight(r#"  {"level":"info"}"#).is_empty());
+        assert_ne!(highlight(r#"  {"level":"info"}"#), []);
     }
 
     #[test]

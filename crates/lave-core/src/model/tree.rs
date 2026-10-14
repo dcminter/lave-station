@@ -634,8 +634,8 @@ mod tests {
     fn empty_listings_produce_empty_nodes_rather_than_missing_ones() {
         let tree = build(None, &[], &[]);
 
-        assert!(sidebar_images(&tree).children.is_empty());
-        assert!(sidebar_containers(&tree).children.is_empty());
+        assert_eq!(sidebar_images(&tree).children, []);
+        assert_eq!(sidebar_containers(&tree).children, []);
         assert_eq!(sidebar_images(&tree).description.as_deref(), Some("0"));
     }
 

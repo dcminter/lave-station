@@ -1,0 +1,5 @@
+# Bump deliberately: new clippy lints break CI under -D warnings.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

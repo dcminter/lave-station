@@ -421,9 +421,9 @@ mod live_tests {
     async fn the_probe_reports_a_real_daemon() {
         let environment = engine().await.probe().await.expect("probe succeeds");
 
-        assert!(!environment.server_version.is_empty());
-        assert!(!environment.api_version.is_empty());
-        assert!(!environment.storage_driver.is_empty());
+        assert_ne!(environment.server_version, "");
+        assert_ne!(environment.api_version, "");
+        assert_ne!(environment.storage_driver, "");
     }
 
     #[tokio::test]
@@ -732,7 +732,7 @@ mod live_tests {
             .await
             .expect("reads history");
 
-        assert!(!history.is_empty());
+        assert_ne!(history, []);
         assert!(
             history.iter().any(|entry| !entry.created_by.is_empty()),
             "at least one record should name what built it"

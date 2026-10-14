@@ -291,7 +291,10 @@ mod tests {
     fn an_image_with_no_containers_reports_an_empty_list_rather_than_guessing() {
         let images = [image("nginx", &["nginx:1.27"])];
 
-        assert!(containers_of(&images[0], &[]).is_empty());
+        assert_eq!(
+            containers_of(&images[0], &[]),
+            Vec::<&ContainerSummary>::new()
+        );
     }
 
     #[test]
@@ -449,7 +452,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sha256:webgui"]
         );
-        assert!(derived_from(find(&images, "webgui"), &images, &index).is_empty());
+        assert_eq!(
+            derived_from(find(&images, "webgui"), &images, &index),
+            Vec::<&ImageSummary>::new()
+        );
     }
 
     #[test]
@@ -489,7 +495,10 @@ mod tests {
         let empty = LayerIndex::new();
 
         assert!(base_of(find(&images, "webgui"), &images, &empty).is_none());
-        assert!(derived_from(find(&images, "alpine"), &images, &empty).is_empty());
+        assert_eq!(
+            derived_from(find(&images, "alpine"), &images, &empty),
+            Vec::<&ImageSummary>::new()
+        );
     }
 
     #[test]
@@ -500,7 +509,10 @@ mod tests {
         index.insert("sha256:two", layers(&["l1", "l2"]));
 
         assert!(base_of(&images[0], &images, &index).is_none());
-        assert!(derived_from(&images[0], &images, &index).is_empty());
+        assert_eq!(
+            derived_from(&images[0], &images, &index),
+            Vec::<&ImageSummary>::new()
+        );
         assert_eq!(
             same_layers_as(&images[0], &images, &index)
                 .iter()

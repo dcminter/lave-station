@@ -282,7 +282,7 @@ mod tests {
 
         let effects = activity.apply(Signal::Observed(event("network", "connect", "", 1001)));
 
-        assert!(effects.is_empty());
+        assert_eq!(effects, []);
         assert_eq!(activity.log().len(), 1);
     }
 

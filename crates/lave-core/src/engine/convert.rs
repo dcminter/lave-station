@@ -357,7 +357,7 @@ mod tests {
         // 128 MB of usage is cache it is not really holding.
         assert_eq!(stats.memory_usage, 716_800);
         assert_eq!(stats.memory_limit, 64_960_094_208);
-        assert!(!stats.id.is_empty());
+        assert_ne!(stats.id, "");
         assert_ne!(stats.id, "fallback", "the sample names its own container");
     }
 
@@ -467,10 +467,10 @@ mod tests {
 
         assert_eq!(containers.len(), 5);
         let first = containers.first().expect("at least one container");
-        assert!(!first.id.is_empty());
+        assert_ne!(first.id, "");
         assert_eq!(first.state, ContainerState::Exited);
         assert!(!first.state.is_active());
-        assert!(!first.status.is_empty());
+        assert_ne!(first.status, "");
     }
 
     #[test]
@@ -478,7 +478,7 @@ mod tests {
         for container in containers() {
             for name in &container.names {
                 assert!(!name.starts_with('/'), "name still has a slash: {name}");
-                assert!(!name.is_empty());
+                assert_ne!(name, "");
             }
         }
     }
@@ -490,7 +490,7 @@ mod tests {
             .find(|container| container.labels.contains_key("com.docker.compose.project"))
             .expect("the fixture contains compose-managed containers");
 
-        assert!(!container.networks.is_empty());
+        assert_ne!(container.networks, Vec::<String>::new());
         assert!(container.networks.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(environment.cgroup_version, "2");
         assert!(environment.cpus > 0);
         assert!(environment.memory_total > 0);
-        assert!(!environment.kernel_version.is_empty());
+        assert_ne!(environment.kernel_version, "");
     }
 
     #[test]

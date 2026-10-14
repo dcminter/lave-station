@@ -1058,7 +1058,7 @@ mod tests {
             .and_then(|offer| offer.confirmation)
             .expect("remove confirms");
 
-        assert!(confirmation.items.is_empty());
+        assert_eq!(confirmation.items, Vec::<String>::new());
         // 50 MiB, rendered in the decimal units format::bytes uses throughout.
         assert!(
             confirmation.body.contains("52.4 MB"),
@@ -1072,7 +1072,7 @@ mod tests {
         let running = container("web", ContainerState::Running);
         let tagged = image("nginx:1.27");
 
-        assert!(for_environment(&[running], &[tagged]).is_empty());
+        assert_eq!(for_environment(&[running], &[tagged]), []);
     }
 
     #[test]
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn nothing_checked_offers_nothing() {
-        assert!(for_selection(&[], &[], &[], &[]).is_empty());
+        assert_eq!(for_selection(&[], &[], &[], &[]), []);
     }
 
     #[test]

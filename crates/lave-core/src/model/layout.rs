@@ -181,7 +181,7 @@ mod tests {
     fn nothing_to_place_needs_no_height() {
         let (placed, height) = place(&[], 2);
 
-        assert!(placed.is_empty());
+        assert_eq!(placed, []);
         assert_eq!(height, 0);
     }
 

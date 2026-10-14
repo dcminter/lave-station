@@ -693,12 +693,8 @@ mod tests {
 
     #[test]
     fn empty_listings_produce_a_table_with_headings_and_no_rows() {
-        assert!(images(&[], &[], NOW, true).rows.is_empty());
-        assert!(
-            containers(&[], &StatsIndex::new(), NOW, true)
-                .rows
-                .is_empty()
-        );
+        assert_eq!(images(&[], &[], NOW, true).rows, []);
+        assert_eq!(containers(&[], &StatsIndex::new(), NOW, true).rows, []);
         assert_eq!(
             containers(&[], &StatsIndex::new(), NOW, true).columns.len(),
             6
