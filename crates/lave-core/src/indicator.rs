@@ -113,11 +113,6 @@ pub fn model(activity: &Activity, counts: Counts) -> IndicatorModel {
         items.push(MenuItem::Info(containers_line(counts)));
     }
 
-    if let Some(latest) = activity.log().front() {
-        items.push(MenuItem::Separator);
-        items.push(MenuItem::Info(latest.text.clone()));
-    }
-
     items.push(MenuItem::Separator);
     items.push(MenuItem::Action {
         action: MenuAction::Quit,
@@ -276,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn the_most_recent_event_is_surfaced_in_the_menu() {
+    fn events_are_kept_out_of_the_menu_because_their_names_are_long_and_churn() {
         let mut activity = connected();
         activity.apply(Signal::Observed(EngineEvent {
             kind: "container".to_owned(),
@@ -286,7 +281,12 @@ mod tests {
             time: 1001,
         }));
 
-        assert!(labels(&model(&activity, counts())).contains(&"container start: web".to_owned()));
+        let rendered = labels(&model(&activity, counts()));
+
+        assert!(
+            !rendered.iter().any(|label| label.contains("web")),
+            "got {rendered:?}"
+        );
     }
 
     #[test]
