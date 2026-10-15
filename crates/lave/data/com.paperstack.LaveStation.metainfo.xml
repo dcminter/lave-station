@@ -38,6 +38,11 @@
   </categories>
 
   <releases>
+    <release version="0.3.0" date="2026-10-15">
+      <description>
+        <p>Get rid of the docker event from the panel menu.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-09-11">
       <description>
         <p>The sidebar can be folded away, from the header bar or with F9, to give the
