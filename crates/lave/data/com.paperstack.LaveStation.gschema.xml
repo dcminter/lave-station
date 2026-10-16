@@ -14,7 +14,7 @@
     </key>
 
     <key name="sidebar-visible" type="b">
-      <default>true</default>
+      <default>false</default>
       <summary>Show the object sidebar</summary>
       <description>
         Off when the user has folded the sidebar away to give the detail pane the whole

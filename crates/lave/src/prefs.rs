@@ -199,7 +199,7 @@ mod tests {
         let stored = Settings {
             sidebar_width: 421,
             // Not the default, so the round trip proves it was stored.
-            sidebar_visible: false,
+            sidebar_visible: true,
             show_stopped_containers: false,
             show_untagged_images: false,
             column_widths: ColumnWidths::from([

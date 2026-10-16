@@ -46,7 +46,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
-            sidebar_visible: true,
+            sidebar_visible: false,
             // Both tables open onto the working set: the containers actually executing,
             // and the images still named by a tag. Neither hides anything the user
             // cannot see: the toggle above each table says how many rows the other view
@@ -134,7 +134,7 @@ mod tests {
         let settings = Settings::default();
 
         assert_eq!(settings.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
-        assert!(settings.sidebar_visible, "the sidebar opens shown");
+        assert!(!settings.sidebar_visible, "the sidebar opens folded away");
         // Running containers and tagged images: what is on the machine now, rather than
         // that plus everything left behind.
         assert!(!settings.show_stopped_containers);
